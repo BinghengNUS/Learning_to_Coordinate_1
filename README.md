@@ -2,7 +2,7 @@
 Learning to Coordinate (L2C) is a general framework that meta-learns key hyperparameters for ADMM-DDP-based multiagent distributed trajectory optimization and adapts to diverse tasks and team sizes. These hyperparameters are modeled using lightweight, agent-wise nneural networks to achieve the adaptations, trained efficiently through analytically differentiating the entire ADMM-DDP pipeline end-to-end. We validate the effectiveness of L2C on a multilift system, a challenging multiagent system consisting of multiple quadrotors cooperatively transporting a cable-suspended load. Our method achieves faster gradient computation than state-of-the-art methods such as PDP [[1]](#1)., and exhibit strong generalizability to diverse system dynamics, tasks, and team sizes without extra tuning.
 
 |                                             A Diagram of the L2C framework                                                      |
-:----------------------------------------------------------------------------------------------------------------------------------:
+|---------------------------------------------------------------------------------------------------------------------------------|
 <img width="3599" height="1552" alt="diagram_github" src="https://github.com/user-attachments/assets/94cf529a-96d2-4e87-b3c5-f9783a90621c" />
 
 ## Table of contents
