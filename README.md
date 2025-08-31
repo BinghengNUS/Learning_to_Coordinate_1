@@ -1,5 +1,5 @@
 # Learning_to_Coordinate_1
-Learning to Coordinate (L2C) is a general framework that meta-learns key hyperparameters for ADMM-DDP-based multiagent distributed trajectory optimization and adapts to diverse tasks and team sizes. These hyperparameters are modeled using lightweight, agent-wise nneural networks to achieve the adaptations, trained efficiently through analytically differentiating the entire ADMM-DDP pipeline end-to-end. We validate the effectiveness of L2C on a multilift system, a challenging multiagent system consisting of multiple quadrotors cooperatively transporting a cable-suspended load.
+Learning to Coordinate (L2C) is a general framework that meta-learns key hyperparameters for ADMM-DDP-based multiagent distributed trajectory optimization and adapts to diverse tasks and team sizes. These hyperparameters are modeled using lightweight, agent-wise nneural networks to achieve the adaptations, trained efficiently through analytically differentiating the entire ADMM-DDP pipeline end-to-end. We validate the effectiveness of L2C on a multilift system, a challenging multiagent system consisting of multiple quadrotors cooperatively transporting a cable-suspended load. Our method achieves faster gradient computation than state-of-the-art methods such as PDP [[1]](#1)., and exhibit strong generalizability to diverse system dynamics, tasks, and team sizes without extra tuning.
 
 |                                             A Diagram of the L2C framework                                                      |
 :----------------------------------------------------------------------------------------------------------------------------------:
@@ -28,6 +28,22 @@ The implementation of L2C for multilift systems is straightforward to setup.  Si
 2. Run the same Python file $M$ times, where $M$ denotes the task count, by selecting 'e' for evaluation.
 3. Run the Python file '**Meta_learning_cable_trajectories.py**' to meta-learn dynamically feasible cable trajectories. Set '*sysm_para*' in Line 38 to be the same as that in the file '**Meta_learning_cable_references.py**'， except for the last parameter denoting the quadrotor mass.
 
-        Training loss       |      Episode 0     | Episode 33
-   :-----------------------------------------------------------:|:--------------------------------------------------------------:|:--------------------------------------------------------------:
+|       Training loss       |      Episode 0     | Episode 33|
+|-----------------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
 <img width="870" height="835" alt="meanloss_comparison2" src="https://github.com/user-attachments/assets/6f7b6053-11b9-4b21-b5b6-4d4c4fec7719" /> | <img width="817" height="853" alt="multiagent007" src="https://github.com/user-attachments/assets/0c4824b2-0b60-4bff-ad23-63e68db2e75b" />  | <img width="817" height="853" alt="multiagent3307" src="https://github.com/user-attachments/assets/3677702e-e075-4165-942e-2f86cf962dc9" />
+
+|     Three-quadrotor team | Six-quadrotor team | Seven-quadrotor team |
+|-----------------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
+![3_lift_-3_2_DDP](https://github.com/user-attachments/assets/540b1b1c-a35c-4dc6-bba5-f5c307c66c15) | ![6_lift_-3_2_DDP](https://github.com/user-attachments/assets/49a68a58-6f62-48fd-836a-3035bea2d15f) | ![7_lift_-3_2_DDP](https://github.com/user-attachments/assets/df62b0c8-aa98-4217-8cd2-4551f09a1973)
+
+
+## 3. Contact Us
+If you encounter a bug in your implementation of the code, please do not hesitate to inform me.
+* Name: Dr. Bingheng Wang
+* Email: wangbingheng@u.nus.edu
+
+
+
+## References
+<a id="1">[1]</a> 
+Jin, Wanxin and Mou, Shaoshuai and Pappas, George J, "Safe pontryagin differentiable programming", Advances in Neural Information Processing Systems, 34, 16034--16050, 2021
