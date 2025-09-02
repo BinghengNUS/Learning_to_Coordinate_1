@@ -74,6 +74,8 @@ def convert_nn(nn_i_outcolumn):
 # generate a list that saves random load center-of-mass coordinates for tasks
 rg_task   = []
 num_task  = 10
+if not os.path.exists("trained_data_meta"):
+    os.makedirs("trained_data_meta")
 for _ in range(num_task):
     # random_rg = np.random.uniform([-0.05,-0.05],[0.05,0.05])
     rg        = np.random.uniform(0,0.04)
@@ -146,8 +148,6 @@ tunable_para0 = np.random.normal(0,0.1,MPC_load.n_Pauto) # initialization
 
 # Solve the load's MPC planner
 def train(m0,v0,lr0,Ref_xl,Ref_Wl,tunable_para0):
-    if not os.path.exists("trained_data_meta"):
-        os.makedirs("trained_data_meta")
     tunable_para = tunable_para0
     i = 1
     i_max      = 25
