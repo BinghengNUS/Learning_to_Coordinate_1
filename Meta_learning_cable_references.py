@@ -76,7 +76,7 @@ rg_task   = []
 num_task  = 10
 for _ in range(num_task):
     # random_rg = np.random.uniform([-0.05,-0.05],[0.05,0.05])
-    rg        = np.random.uniform(0,0.05)
+    rg        = np.random.uniform(0,0.04)
     alpha     = np.random.uniform(0,2*np.pi)
     random_rg = np.array([rg*np.cos(alpha),rg*np.sin(alpha)])
     rg_task  += [random_rg]
