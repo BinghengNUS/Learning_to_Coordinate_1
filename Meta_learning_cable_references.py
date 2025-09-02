@@ -90,8 +90,8 @@ v0        = np.zeros(MPC_load.n_Pauto)
 
 # parameters of ADAM
 m0        = np.zeros(MPC_load.n_Pauto)
-beta1     = 0.01 # 0.8 for better ADMM initialization
-beta2     = 0.001 # 0.5 for better ADMM initialization
+beta1     = 0.9 # 0.8 for better ADMM initialization
+beta2     = 0.999 # 0.5 for better ADMM initialization
 
 """--------------------------------------Define Load Reference---------------------------------------"""
 Coeffx        = np.zeros((2,8))
