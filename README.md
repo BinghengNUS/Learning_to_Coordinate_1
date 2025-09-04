@@ -3,6 +3,21 @@ Learning to Coordinate (L2C) is a general framework that meta-learns key hyperpa
 
 <img width="3599" height="1552" alt="diagram_github" src="https://github.com/user-attachments/assets/94cf529a-96d2-4e87-b3c5-f9783a90621c" />
 
+## Citation
+If you find this work helpful in your publications, we would appreciate citing our paper。
+
+```
+@misc{wang2025learningcoordinatedistributedmetatrajectory,
+      title={Learning to Coordinate: Distributed Meta-Trajectory Optimization Via Differentiable ADMM-DDP}, 
+      author={Bingheng Wang and Yichao Gao and Tianchen Sun and Lin Zhao},
+      year={2025},
+      eprint={2509.01630},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.01630}, 
+}
+```
+
 ## Table of contents
 
 1. [Dependency Packages](#Dependency-Packages)
