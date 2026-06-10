@@ -33,6 +33,10 @@ class MPC_Planner:
         self.e_rel  = e_rel
         # barrier parameter
         self.p_bar  = 1e-6
+        # lower bound of the ADMM penalty parameter
+        self.p_min  = 1e-3
+        self.t_min = 0.01
+        self.t_max = 5
 
     def allocation_martrix(self,rg):
         self.alpha  = 2*np.pi/self.nq
@@ -47,7 +51,8 @@ class MPC_Planner:
             Pi      = np.vstack((I3,S_ri))
             self.Pt = np.append(self.Pt,Pi,axis=1) # the tension mapping matrix: 6-by-3nq with a rank of 6
             self.ra = np.append(self.ra,ri,axis=1) # a matrix that stores the attachment points
-        self.P_pinv = self.Pt.T@LA.inv(self.Pt@self.Pt.T) # pseudo-inverse of P
+        # self.P_pinv = self.Pt.T@LA.inv(self.Pt@self.Pt.T) # pseudo-inverse of P
+        self.P_pinv = LA.pinv(self.Pt)
         self.P_ns   = null_space(self.Pt) # null-space of P, 3nq-by-(3nq-6)
 
     def skew_sym_numpy(self, v):
@@ -73,8 +78,6 @@ class MPC_Planner:
         self.sc_WL = SX.sym('sc_WL',self.n_Wl,1) # Lagrangian multiplier associated with the safe copy control
         self.nv    = SX.sym('nv',3*int(self.nq)-6,1) # null-space vector
         self.n_nv  = self.nv.numel()
-        self.ul    = vertcat(self.Wl,self.nv)
-        self.n_ul  = Wl.numel() + self.nv.numel() # including the dimension of the null-space vector, totally 3nq
         self.Wl_lb = self.n_Wl*[-1e19] #Wl_lb # having the appropriate box constraints on control is very important
         self.Tm_lb = (3*int(self.nq)-6)*[-1e19]
         self.Wl_ub = self.n_Wl*[1e19] #Wl_ub
@@ -82,7 +85,6 @@ class MPC_Planner:
 
     def SetDyn(self, model_l):
         self.Modell   = self.xl + self.dt*model_l # 4th-order Runge-Kutta discrete-time dynamics model
-        self.MDynl_fn = Function('MDynl',[self.xl, self.ul],[self.Modell],['xl0', 'ul0'],['MDynlf'])
         self.MDynl_fn_admm = Function('MDynl_admm',[self.xl,self.Wl],[self.Modell],['xl0','Wl0'],['MDynlf_admm'])
 
     def dir_cosine(self, Euler):
@@ -110,10 +112,15 @@ class MPC_Planner:
 
         return R_bw
     
-    def Discount_rate(self,a):
-        gamma_a = 1/(1+exp(-a)) # Sigmoid function-based discount rate during ADMM iterations
-        return gamma_a
+    def Discount_rate(self,gamma,a,ADMM_max):
+        dis = 1/(1+exp(-gamma*(a - int(ADMM_max/2))))
+        return dis
     
+    def open_loop_penalty(self,rho,gamma,a,ADMM_max,b=0.5):
+        # rho_a = self.p_min + (rho - self.p_min) * 1/(1 + exp(-gamma*(a/(int(ADMM_max)-1)-b))) # iteration-dependent open-loop penalty policy
+        rho_a = self.p_min + (rho - self.p_min) * 1/(1+exp(-gamma*(a - (ADMM_max-1)/2)))
+        return rho_a
+
     def q_2_rotation(self, q): # from body frame to inertial frame
         # no normalization to avoid singularity in optimization
         q0, q1, q2, q3 = q[0], q[1], q[2], q[3] # q0 denotes a scalar while q1, q2, and q3 represent rotational axes x, y, and z, respectively
@@ -126,34 +133,33 @@ class MPC_Planner:
     
     def SetLearnablePara(self):
         self.n_wsl    = self.n_xl # the dimension of the payload state weightings
-        self.p1       = SX.sym('p1') # the penalty parameter 1 in ADMM
-        self.P1_l     = SX.sym('P1_l',1,(2*self.n_wsl+self.n_Wl)) # the hyperparameters of Subproblem 1 in ADMM
+        self.P1_l     = SX.sym('P1_l',1,(2*self.n_wsl+self.n_Wl+4)) # the hyperparameters of Subproblem 1 in ADMM, px,pu,gammax,gammau
         self.n_P1     = self.P1_l.numel()
         self.P2_l     = SX.sym('P2',1,3) # the weights of the cable tension deviation
         self.n_P2     = self.P2_l.numel()
-        self.P_auto   = horzcat(self.P1_l,self.P2_l,self.p1) # the total learnable parameters
+        self.P_auto   = horzcat(self.P1_l,self.P2_l) # the total learnable parameters
         self.n_Pauto  = self.P_auto.numel()
 
     
-    def SetCostDyn_ADMM(self):
+    def SetCostDyn_ADMM(self,ADMM_max):
         self.ref_xl   = SX.sym('ref_xl',self.n_xl,1)
         self.ref_Wl   = SX.sym('ref_Wl',self.n_Wl,1)
-        self.a        = SX.sym('a',1) # the ADMM iteration index
-        scql          = self.sc_xl[6:10,0]
         track_error_l = self.xl - self.ref_xl
         ctrl_error_l  = self.Wl - self.ref_Wl
-        self.dis_r    = self.Discount_rate(self.a) # iteration-specific discount rate, a global variable within the class
-        self.p1_dis   = self.dis_r*self.p1
-        xl_const_v    = self.xl - self.sc_xl + self.sc_xL/self.p1_dis # the state constraint violation
-        Wl_const_v    = self.Wl - self.sc_Wl + self.sc_WL/self.p1_dis # the control constraint violation
+        self.a        = SX.sym('a',1) # the ADMM iteration index
+        scql          = self.sc_xl[6:10,0]
         self.Ql_k     = diag(self.P1_l[0,0:self.n_wsl])
         self.Ql_N     = diag(self.P1_l[0,self.n_wsl:2*self.n_wsl])
         self.Rl_k     = diag(self.P1_l[0,2*self.n_wsl:2*self.n_wsl+self.n_Wl])
+        self.px_dis   = self.open_loop_penalty(self.P1_l[0,-4],self.P1_l[0,-2],self.a,ADMM_max)
+        self.pu_dis   = self.open_loop_penalty(self.P1_l[0,-3],self.P1_l[0,-1],self.a,ADMM_max)
         # path cost of Subproblem 1 (MPC)
+        xl_const_v    = self.xl - self.sc_xl + self.sc_xL/self.px_dis # the state constraint violation
+        Wl_const_v    = self.Wl - self.sc_Wl + self.sc_WL/self.pu_dis # the control constraint violation
         self.Jl_k_bar_admm = 1/2 * (track_error_l.T@self.Ql_k@track_error_l + ctrl_error_l.T@self.Rl_k@ctrl_error_l) #+ self.h_norm
-        self.Jl_k_hat_admm = self.p1_dis/2*xl_const_v.T@xl_const_v + self.p1_dis/2*Wl_const_v.T@Wl_const_v 
+        self.Jl_k_hat_admm = self.px_dis/2*xl_const_v.T@xl_const_v + self.pu_dis/2*Wl_const_v.T@Wl_const_v 
         self.Jl_k_admm     = self.Jl_k_bar_admm + self.Jl_k_hat_admm 
-        self.Jl_kfn_admm   = Function('Jl_k_admm',[self.xl, self.Wl, self.ref_xl, self.ref_Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.Jl_k_admm],['xl0', 'Wl0', 'refxl0', 'refWl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'p10', 'a0'],['Jl_kf_admm'])
+        self.Jl_kfn_admm   = Function('Jl_k_admm',[self.xl, self.Wl, self.ref_xl, self.ref_Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.Jl_k_admm],['xl0', 'Wl0', 'refxl0', 'refWl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'a0'],['Jl_kf_admm'])
         # terminal cost of Subproblem 1 (MPC)
         self.Jl_N_admm     = 1/2 * track_error_l.T@self.Ql_N@track_error_l 
         self.Jl_Nfn_admm   = Function('Jl_N_admm',[self.xl, self.ref_xl, self.P1_l],[self.Jl_N_admm],['xl0', 'refxl0', 'P1l0'],['Jl_Nf_admm'])
@@ -170,10 +176,10 @@ class MPC_Planner:
             ti   = t[(3*i):(3*(i+1))]
             tension_error = ti-self.ref_ti
             self.J2_k    += 1/2 *tension_error.T@self.R2_k@tension_error
-        self.J2_k_admm     = self.J2_k + self.p1_dis/2*xl_const_v.T@xl_const_v + self.p1_dis/2*Wl_const_v.T@Wl_const_v 
-        self.J2_kfn_admm   = Function('J2_k_admm',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.J2_k_admm],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['J2_kf_admm'])
-        self.J2_k_soft = self.J2_k_admm + self.T_cons + self.G_ij + self.G_io + self.sch_norm
-        self.J2_k_orig = self.J2_k + self.T_cons + self.G_ij + self.G_io + self.sch_norm
+        self.J2_k_admm     = self.J2_k + self.px_dis/2*xl_const_v.T@xl_const_v + self.pu_dis/2*Wl_const_v.T@Wl_const_v 
+        self.J2_kfn_admm   = Function('J2_k_admm',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.J2_k_admm],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0','P2l0', 'a0'],['J2_kf_admm'])
+        self.J2_k_soft = self.J2_k_admm + self.T_cons + self.G_ij + self.G_io + self.sch_norm + self.G_lo + self.Ei_Pil
+        self.J2_k_orig = self.J2_k + self.T_cons + self.G_ij  + self.G_io + self.sch_norm + self.G_lo + self.Ei_Pil
 
 
     def system_derivatives_DDP_ADMM(self):
@@ -189,9 +195,9 @@ class MPC_Planner:
         self.lxN_fn = Function('lxN',[self.xl,self.ref_xl,self.P1_l],[self.lxN],['xl0','refxl0','P1l0'],['lxNf'])
         self.lu     = jacobian(self.Jl_k_admm,self.Wl)
         self.Qx     = self.lx.T + self.Fx.T@self.Vx
-        self.Qx_fn  = Function('Qx',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.Qx],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','p10','a0'],['Qxf'])
+        self.Qx_fn  = Function('Qx',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.Qx],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','a0'],['Qxf'])
         self.Qu     = self.lu.T + self.Fu.T@self.Vx
-        self.Qu_fn  = Function('Qu',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.Qu],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','p10','a0'],['Quf'])
+        self.Qu_fn  = Function('Qu',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.Qu],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','a0'],['Quf'])
         # hessians of the system dynamics, the cost function, and the Q value function
         self.FxVx   = self.Fx.T@self.Vx
         self.dFxVxdx= jacobian(self.FxVx,self.xl) # the hessian of the system dynamics may cause heavy computational burden
@@ -204,27 +210,27 @@ class MPC_Planner:
         self.lxu    = jacobian(self.lx,self.Wl)
         self.luu    = jacobian(self.lu,self.Wl)
         self.Qxx_bar    = self.lxx #+ alpha*self.dFxVxdx  # removing this model hessian can enhance the DDP stability for a larger time step!!!! The removal can also accelerate the DDP computation significantly!
-        self.Qxx_bar_fn = Function('Qxx_bar',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.Qxx_bar],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','p10','a0'],['Qxx_bar_f'])
+        self.Qxx_bar_fn = Function('Qxx_bar',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.Qxx_bar],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','a0'],['Qxx_bar_f'])
         self.Qxx_hat    = self.Fx.T@self.Vxx@self.Fx
         self.Qxx_hat_fn = Function('Qxx_hat',[self.xl,self.Wl,self.Vxx],[self.Qxx_hat],['xl0','Wl0','Vxx0'],['Qxx_hat_f'])
         self.Qxu_bar    = self.lxu #+ alpha*self.dFxVxdu  # including the model hessian entails a very small time step size (e.g., 0.01s)
-        self.Qxu_bar_fn = Function('Qxu_bar',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.Qxu_bar],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','p10','a0'],['Qxu_bar_f'])
+        self.Qxu_bar_fn = Function('Qxu_bar',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.Qxu_bar],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','a0'],['Qxu_bar_f'])
         self.Qxu_hat    = self.Fx.T@self.Vxx@self.Fu
         self.Qxu_hat_fn = Function('Qxu_hat',[self.xl,self.Wl,self.Vxx],[self.Qxu_hat],['xl0','Wl0','Vxx0'],['Qxu_hat_f'])
         self.Quu_bar    = self.luu #+ alpha*self.dFuVxdu
-        self.Quu_bar_fn = Function('Quu_bar',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.Quu_bar],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','p10','a0'],['Quu_bar_f'])
+        self.Quu_bar_fn = Function('Quu_bar',[self.xl,self.Wl,self.Vx,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.Quu_bar],['xl0','Wl0','Vx0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','a0'],['Quu_bar_f'])
         self.Quu_hat    = self.Fu.T@self.Vxx@self.Fu 
         self.Quu_hat_fn = Function('Quu_hat',[self.xl,self.Wl,self.Vxx],[self.Quu_hat],['xl0','Wl0','Vxx0'],['Quu_hat_f'])
         # hessians w.r.t. the hyperparameters
         self.lxp    = jacobian(self.lx,self.P_auto)
-        self.lxp_fn = Function('lxp',[self.xl,self.Wl,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.lxp],['xl0','Wl0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','p10','a0'],['lxpf'])
+        self.lxp_fn = Function('lxp',[self.xl,self.Wl,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.lxp],['xl0','Wl0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','a0'],['lxpf'])
         self.lup    = jacobian(self.lu,self.P_auto)
-        self.lup_fn = Function('lup',[self.xl,self.Wl,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.p1, self.a],[self.lup],['xl0','Wl0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','p10','a0'],['lupf'])
+        self.lup_fn = Function('lup',[self.xl,self.Wl,self.ref_xl,self.ref_Wl,self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.a],[self.lup],['xl0','Wl0','refxl0','refWl0','scxl0','scxL0','scWl0','scWL0','P1l0','a0'],['lupf'])
         self.lxNp   = jacobian(self.lxN,self.P_auto)
         self.lxNp_fn= Function('lxNp',[self.xl,self.ref_xl,self.P1_l],[self.lxNp],['xl0','refxl0','P1l0'],['lxNpf'])
     
 
-    def Get_AuxSys_DDP(self,opt_sol1,Ref_xl,Ref_Wl,scxl_opt,scWl_opt,Y_l,Eta_l,weight1,p1,i_admm):
+    def Get_AuxSys_DDP(self,opt_sol1,Ref_xl,Ref_Wl,scxl_opt,scWl_opt,Y_l,Eta_l,weight1,i_admm):
         xl_opt   = opt_sol1['xl_opt']
         Wl_opt   = opt_sol1['Wl_opt']
         LxNp  = self.lxNp_fn(xl0=xl_opt[-1,:],refxl0=Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl],P1l0=weight1)['lxNpf'].full()
@@ -234,10 +240,10 @@ class MPC_Planner:
         for k in range(self.N):
             Lxp[k] = self.lxp_fn(xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                 scxl0=scxl_opt[k,:],scxL0=Y_l[:,k],
-                                scWl0=scWl_opt[k,:],scWL0=Eta_l[:,k],P1l0=weight1,p10=p1,a0=i_admm)['lxpf'].full()
+                                scWl0=scWl_opt[k,:],scWL0=Eta_l[:,k],P1l0=weight1,a0=i_admm)['lxpf'].full()
             Lup[k] = self.lup_fn(xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                 scxl0=scxl_opt[k,:],scxL0=Y_l[:,k],
-                                scWl0=scWl_opt[k,:],scWL0=Eta_l[:,k],P1l0=weight1,p10=p1,a0=i_admm)['lupf'].full()
+                                scWl0=scWl_opt[k,:],scWL0=Eta_l[:,k],P1l0=weight1,a0=i_admm)['lupf'].full()
         
         auxSys1 = { "HxxN":LxxN,
                     "HxNp":LxNp,
@@ -266,7 +272,7 @@ class MPC_Planner:
         raise LA.LinAlgError("Cholesky failed even with jitter")
 
 
-    def DDP_ADMM_Subp1(self,xl_0,Ref_xl,Ref_Wl,weight1,scxl_opt_hat,scWl_opt_hat,Y_l,Eta_l,p1,max_iter,e_tol,i,i_admm):
+    def DDP_ADMM_Subp1(self,xl_0,Ref_xl,Ref_Wl,weight1,scxl_opt_hat,scWl_opt_hat,Y_l,Eta_l,max_iter,e_tol,i_admm):
         reg          = 1e-6 # Regularization term
         reg_max      = 1    # cap to avoid runaway
         reg_up       = 10.0 # how much to bump when ill-conditioned
@@ -282,23 +288,24 @@ class MPC_Planner:
         
         # Initial trajectory and initial cost 
         cost_prev = 0
-        if i ==0:
-            for k in range(self.N):
-                u_k    = np.reshape(Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],(self.n_Wl,1))
-                X_nominal[:,k+1:k+2] = self.MDynl_fn_admm(xl0=X_nominal[:,k],Wl0=u_k)['MDynlf_admm'].full()
-                U_nominal[:,k:k+1]   = u_k
-                cost_prev     += self.Jl_kfn_admm(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
+        # if i_admm ==0:
+        for k in range(self.N):
+            u_k    = np.reshape(Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],(self.n_Wl,1))
+            X_nominal[:,k:k+1] = self.MDynl_fn_admm(xl0=X_nominal[:,k],Wl0=u_k)['MDynlf_admm'].full() # start from a bad state
+            # X_nominal[:,k:k+1] = np.reshape(Ref_xl[k*self.n_xl:(k+1)*self.n_xl],(self.n_xl,1))
+            U_nominal[:,k:k+1]   = u_k
+            cost_prev     += self.Jl_kfn_admm(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                              scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                             scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,p10=p1,a0=i_admm)['Jl_kf_admm'].full()
-            cost_prev += self.Jl_Nfn_admm(xl0=X_nominal[:,-1],refxl0=Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl],P1l0=weight1)['Jl_Nf_admm'].full()
-        else:
-            for k in range(self.N):
-                X_nominal[:,k+1:k+2] = np.reshape(scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],(self.n_xl,1))
-                U_nominal[:,k:k+1]   = np.reshape(scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],(self.n_Wl,1))
-                cost_prev     += self.Jl_kfn_admm(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
-                                             scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                             scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],p10=p1,a0=i_admm)['Jl_kf_admm'].full()
-            cost_prev += self.Jl_Nfn_admm(xl0=X_nominal[:,-1],refxl0=Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl],P1l0=weight1)['Jl_Nf_admm'].full()
+                                             scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,a0=i_admm)['Jl_kf_admm'].full()
+        cost_prev += self.Jl_Nfn_admm(xl0=X_nominal[:,-1],refxl0=Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl],P1l0=weight1)['Jl_Nf_admm'].full()
+        # else:
+        #     for k in range(self.N):
+        #         X_nominal[:,k:k+1] = np.reshape(scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],(self.n_xl,1))
+        #         U_nominal[:,k:k+1]   = np.reshape(scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],(self.n_Wl,1))
+        #         cost_prev     += self.Jl_kfn_admm(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
+        #                                      scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
+        #                                      scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],a0=i_admm)['Jl_kf_admm'].full()
+        #     cost_prev += self.Jl_Nfn_admm(xl0=X_nominal[:,-1],refxl0=Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl],P1l0=weight1)['Jl_Nf_admm'].full()
 
         
         Qxx_bar     = self.N*[np.zeros((self.n_xl,self.n_xl))]
@@ -323,28 +330,29 @@ class MPC_Planner:
             for k in reversed(range(self.N)): # N-1, N-2,...,0
                 Qx_k  = self.Qx_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vx0=Vx[k+1],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                     scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,p10=p1,a0=i_admm)['Qxf'].full()
+                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,a0=i_admm)['Qxf'].full()
                 Qu_k  = self.Qu_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vx0=Vx[k+1],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                     scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,p10=p1,a0=i_admm)['Quf'].full()
+                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,a0=i_admm)['Quf'].full()
                 Qxx_bar_k = self.Qxx_bar_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vx0=Vx[k+1],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                     scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,p10=p1,a0=i_admm)['Qxx_bar_f'].full()
+                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,a0=i_admm)['Qxx_bar_f'].full()
                 Qxx_hat_k = self.Qxx_hat_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vxx0=Vxx[k+1])['Qxx_hat_f'].full()
                 Qxx_k     = Qxx_bar_k + Qxx_hat_k
                 Qxu_bar_k = self.Qxu_bar_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vx0=Vx[k+1],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                     scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,p10=p1,a0=i_admm)['Qxu_bar_f'].full()
+                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,a0=i_admm)['Qxu_bar_f'].full()
                 Qxu_hat_k = self.Qxu_hat_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vxx0=Vxx[k+1])['Qxu_hat_f'].full()
                 Qxu_k     = Qxu_bar_k + Qxu_hat_k
                 Quu_bar_k = self.Quu_bar_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vx0=Vx[k+1],refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                     scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,p10=p1,a0=i_admm)['Quu_bar_f'].full()
+                                    scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,a0=i_admm)['Quu_bar_f'].full()
                 Quu_hat_k = self.Quu_hat_fn(xl0=X_nominal[:,k],Wl0=U_nominal[:,k],Vxx0=Vxx[k+1])['Quu_hat_f'].full()
                 Quu_k     = Quu_bar_k + Quu_hat_k
                 Quu_reg_k = Quu_k + reg*I_u
-                L, _jitter   = self.try_cholesky(Quu_reg_k, jitter0=0.0)
-                if L is None:
+                try:
+                    L, _jitter = self.try_cholesky(Quu_reg_k, jitter0=0.0)
+                except LA.LinAlgError:
                     chol_failed = True
                     break
                 Quu_inv      = self.chol_solve(L, I_u) # only for computing the gradients
@@ -384,7 +392,7 @@ class MPC_Planner:
                     U_new[:,k:k+1]    = u_k
                     cost_new   += self.Jl_kfn_admm(xl0=X_new[:,k],Wl0=u_k,refxl0=Ref_xl[k*self.n_xl:(k+1)*self.n_xl],refWl0=Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],
                                              scxl0=scxl_opt_hat[k*self.n_xl:(k+1)*self.n_xl],scxL0=Y_l[k*self.n_xl:(k+1)*self.n_xl],
-                                             scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,p10=p1,a0=i_admm)['Jl_kf_admm'].full()
+                                             scWl0=scWl_opt_hat[k*self.n_Wl:(k+1)*self.n_Wl],scWL0=Eta_l[k*self.n_Wl:(k+1)*self.n_Wl],P1l0=weight1,a0=i_admm)['Jl_kf_admm'].full()
                 cost_new   += self.Jl_Nfn_admm(xl0=X_new[:,-1],refxl0=Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl],P1l0=weight1)['Jl_Nf_admm'].full()
                 # Check if the cost decreased
                 if cost_new < cost_prev:
@@ -430,47 +438,66 @@ class MPC_Planner:
         self.sch_norm = 1/(2*self.p_bar)*(ql_knorm-1)**2
         self.ql_fn    = Function('norm_ql',[self.sc_xl],[ql_knorm],['scxl0'],['norm_qlf'])
         t    = self.P_pinv@Wlb + self.P_ns@self.nv # 3nq-by-1 total tension vector in the load's body frame, at the kth step
-        Pi   = [] # list that stores all the quadrotors' planar positions in the world frame
-        Pil  = [] # list that stores all the quadrotors' planar positions in the body frame
+        
         self.Gij_admm   = [] # list that stores all the safe inter-robot inequality constraints
         self.Gi1_admm   = [] # list that stores the obstacle-avoidance constraints of all the quadrotors for the 1st obstacle
         self.Gi2_admm   = [] # list that stores the obstacle-avoidance constraints of all the quadrotors for the 2nd obstacle
+        self.Gio_admm   = []
         self.Ti_admm    = [] # list that stores the tension magnitudes
         self.T_cons = 0 # barrier functions of box constraints on the tension magnitude
-        for i in range(int(self.nq)):
-            ri   = np.reshape(self.ra[:,i],(3,1)) # ith attachment point in the load's body frame
-            ti   = t[(3*i):(3*(i+1))] # ith tension, a 3-by-1 vector, in the load's body frame
-            pi   = pl + Rl@(ri+self.cl0*ti/norm_2(ti)) # ith quadrotor's position in the world frame
-            pil  = ri+self.cl0*ti/norm_2(ti) # load body frame
-            Pi  += [pi[0:2]]
-            Pil += [pil[0:2]]
-            ti_m = ti.T@ti
-            ti_fn= Function('t_admm'+str(i),[self.sc_xl,self.sc_Wl,self.nv],[ti_m],['scxl0','scWl0','tm0'],['t'+str(i)+'f_admm'])
-            self.t_min = 0.01
-            self.t_max = 10
-            self.T_cons += -self.p_bar * log(ti_m-self.t_min**2)
-            self.T_cons += -self.p_bar * log(self.t_max**2-ti_m)
-            self.Ti_admm += [ti_fn]
-        k = 0
-        self.G_ij    = 0 # barrier functions of safe inter-robot constraints on quadrotors' planar positions
-        self.G_io    = 0 # barrier functions of safe collision-avoidance constraints on quadrotors' planar positions 
-        
-        for i in range(int(self.nq)):
-            go1   = (Pi[i]-pob1).T@(Pi[i]-pob1) - ((self.rq + self.ro)+self.rq/2)**2 # safe constriant between the obstacle 1 and the ith quadrotor, which should be positive
-            go1_fn= Function('go1_admm'+str(i),[self.sc_xl,self.sc_Wl,self.nv],[go1],['scxl0','scWl0','tm0'],['go1'+str(i)+'f_admm'])
-            self.G_io += -self.p_bar * log(go1)
-            self.Gi1_admm  += [go1_fn]
-            go2   = (Pi[i]-pob2).T@(Pi[i]-pob2) - ((self.rq + self.ro)+self.rq/2)**2 # safe constriant between the obstacle 2 and the ith quadrotor, which should be positive
-            go2_fn= Function('go2_admm'+str(i),[self.sc_xl,self.sc_Wl,self.nv],[go2],['scxl0','scWl0','tm0'],['go2'+str(i)+'f_admm'])
-            self.G_io += -self.p_bar * log(go2)
-            self.Gi2_admm  += [go2_fn]
+        self.G_io   = 0
+        self.G_ij   = 0
+        self.Ei_Pil = 0
+        dis_two     = 2*self.rl*math.sin(self.alpha/2) # distance between two neighbour cable attachment points
+        num_dis     = int(self.cl0/(dis_two)) # discretization number
+        self.G_lo    = 0
+        po1   = (pl[0:2]-pob1).T@(pl[0:2]-pob1) - ((self.ro)+self.rq/2)**2 #[0:2] for x, y [1:3] for y, z
+        self.po1_fn= Function('pl1_admm',[self.sc_xl,self.sc_Wl,self.nv],[po1],['scxl0','scWl0','tm0'],['po1f_admm'])
+        self.G_lo += -self.p_bar * log(po1)
+        po2   = (pl[0:2]-pob2).T@(pl[0:2]-pob2) - ((self.ro)+self.rq/2)**2
+        self.po2_fn= Function('pl2_admm',[self.sc_xl,self.sc_Wl,self.nv],[po2],['scxl0','scWl0','tm0'],['po2f_admm'])
+        self.G_lo += -self.p_bar * log(po2)
 
-            for j in range(i+1,int(self.nq)):
-                gij   = (Pil[i]-Pil[j]).T@(Pil[i]-Pil[j])- (4*self.rq)**2 # safe constraint between two quadrotors
-                gij_fn= Function('g_admm'+str(k),[self.sc_xl,self.sc_Wl,self.nv],[gij],['scxl0','scWl0','tm0'],['g'+str(k)+'f_admm'])
-                self.G_ij += -self.p_bar * log(gij)
-                self.Gij_admm  += [gij_fn]
-                k += 1
+        k = 0
+        for kc in range(1,num_dis+1):
+            for i in range(int(self.nq)):
+                ri   = np.reshape(self.ra[:,i],(3,1)) # ith attachment point in the load's body frame
+                ei   = ri/norm_2(ri)
+                ti   = t[(3*i):(3*(i+1))] # ith tension, a 3-by-1 vector, in the load's body frame
+                pib_kc  = ri + kc/num_dis*self.cl0*ti/norm_2(ti) # ith cable point position in body frame
+                if kc== (num_dis):
+                    pi    = pl + Rl@(ri+kc/num_dis*self.cl0*ti/norm_2(ti)) # ith quadrotor's position in the world frame
+                    go1   = (pi[0:2]-pob1).T@(pi[0:2]-pob1) - ((self.rq + self.ro)+self.rq)**2 # safe constriant between the obstacle 1 and the ith quadrotor, [0:2] for (x,y) [1:3] for (y,z)
+                    go1_fn= Function('go1_admm'+str(i),[self.sc_xl,self.sc_Wl,self.nv],[go1],['scxl0','scWl0','tm0'],['go1'+str(i)+'f_admm'])
+                    self.G_io += -self.p_bar * log(go1)
+                    self.Gi1_admm  += [go1_fn]
+                    go2   = (pi[0:2]-pob2).T@(pi[0:2]-pob2) - ((self.rq + self.ro)+self.rq)**2 # safe constriant between the obstacle 2 and the ith quadrotor, which should be positive
+                    go2_fn= Function('go2_admm'+str(i),[self.sc_xl,self.sc_Wl,self.nv],[go2],['scxl0','scWl0','tm0'],['go2'+str(i)+'f_admm'])
+                    self.G_io += -self.p_bar * log(go2)
+                    self.Gi2_admm  += [go2_fn]
+                    ti_m = ti.T@ti
+                    ti_fn= Function('t_admm'+str(i),[self.sc_xl,self.sc_Wl,self.nv],[ti_m],['scxl0','scWl0','tm0'],['t'+str(i)+'f_admm'])
+                    self.T_cons += -self.p_bar * log(ti_m-self.t_min**2)
+                    self.T_cons += -self.p_bar * log(self.t_max**2-ti_m)
+                    self.Ti_admm += [ti_fn]
+                    eiPil= ei[0:2].T@pib_kc[0:2]
+                    ePil_fn = Function('dir'+str(i),[self.sc_xl,self.sc_Wl,self.nv],[eiPil],['scxl0','scWl0','tm0'],['dir'+str(i)+'f_admm'])
+                    self.Gio_admm += [ePil_fn]
+                    self.Ei_Pil += -self.p_bar * log(eiPil + self.rl)
+                    self.Ei_Pil += -self.p_bar * log(self.cl0+self.rl - eiPil)
+
+                for j in range(i+1,int(self.nq)):
+                    rj   = np.reshape(self.ra[:,j],(3,1)) # jth attachment point in the load's body frame
+                    tj   = t[(3*j):(3*(j+1))] # jth tension, a 3-by-1 vector, in the load's body frame
+                    pjb_kc = rj + kc/num_dis*self.cl0*tj/norm_2(tj) 
+                    gij_kc   = (pib_kc[0:2]-pjb_kc[0:2]).T@(pib_kc[0:2]-pjb_kc[0:2])- (kc/num_dis*4*self.rq)**2 # 4rq in training, 5rq in evaluation
+                    gij_fn= Function('g_admm'+str(k),[self.sc_xl,self.sc_Wl,self.nv],[gij_kc],['scxl0','scWl0','tm0'],['g'+str(k)+'f_admm'])
+                    self.G_ij += -self.p_bar * log(gij_kc)
+                    self.Gij_admm  += [gij_fn]
+                    k += 1
+
+               
+
 
     
     def ADMM_SubP2_Init(self):
@@ -483,49 +510,55 @@ class MPC_Planner:
         self.ubg2 = [] # upper boundary list of constraints
         
         # hyperparameters + external signals
-        P2l      = SX.sym('P2', (self.n_P2 # the hyperparameters of Subproblem2
+        P2l      = SX.sym('P2', (self.n_P1 # the hyperparameters of Subproblem1
+                                +self.n_P2 # the hyperparameters of Subproblem2
                                 +self.n_xl # the state of subproblem 1 at step k
                                 +self.n_xl # the Lagrangian multiplier associated with the state of subproblem 1 at step k
                                 +self.n_Wl # the control of subproblem 1 at step k
                                 +self.n_Wl # the Lagrangian multiplier associated with the control of subproblem 1 at step k
-                                +1 # the ADMM penalty parameter
                                 +1 # the ADMM iteration index
                                 ))
         
         # formulate the NLP
-        P2_l     = P2l[0:self.n_P2]
-        p1       = P2l[self.n_P2+2*self.n_xl+2*self.n_Wl]
+        P1_l     = P2l[0:self.n_P1]
+        P2_l     = P2l[self.n_P1:self.n_P1+self.n_P2]
         i_admm   = P2l[-1]
         Xk          = SX.sym('x',self.n_xl,1) # safe-copy state
         w          += [Xk]
         self.lbw2  += self.xl_lb
         self.ubw2  += self.xl_ub
-        xl_k        = P2l[(self.n_P2):(self.n_P2+self.n_xl)]
+        xl_k        = P2l[(self.n_P1+self.n_P2):(self.n_P1+self.n_P2+self.n_xl)]
        
         Wk          = SX.sym('w',self.n_Wl,1) # safe-copy control
         w          += [Wk]
         self.lbw2  += self.Wl_lb
         self.ubw2  += self.Wl_ub
-        Wl_k        = P2l[(self.n_P2+2*self.n_xl):(self.n_P2+2*self.n_xl+self.n_Wl)]
+        Wl_k        = P2l[(self.n_P1+self.n_P2+2*self.n_xl):(self.n_P1+self.n_P2+2*self.n_xl+self.n_Wl)]
        
         Tk          = SX.sym('tm',self.n_nv,1) # null-space vector, tension modifier
         w          += [Tk]
         self.lbw2  += self.Tm_lb
         self.ubw2  += self.Tm_ub
-        xL_k        = P2l[(self.n_P2+self.n_xl):(self.n_P2+self.n_xl+self.n_xl)]
-        WL_k        = P2l[(self.n_P2+2*self.n_xl+self.n_Wl):(self.n_P2+2*self.n_xl+self.n_Wl+self.n_Wl)]
-        J           = self.J2_kfn_admm(nv0=Tk,xl0=xl_k,Wl0=Wl_k,scxl0=Xk,scxL0=xL_k,scWl0=Wk,scWL0=WL_k,P2l0=P2_l,p10=p1,a0=i_admm)['J2_kf_admm']
+        xL_k        = P2l[(self.n_P1+self.n_P2+self.n_xl):(self.n_P1+self.n_P2+self.n_xl+self.n_xl)]
+        WL_k        = P2l[(self.n_P1+self.n_P2+2*self.n_xl+self.n_Wl):(self.n_P1+self.n_P2+2*self.n_xl+self.n_Wl+self.n_Wl)]
+        J           = self.J2_kfn_admm(nv0=Tk,xl0=xl_k,Wl0=Wl_k,scxl0=Xk,scxL0=xL_k,scWl0=Wk,scWL0=WL_k,P1l0=P1_l,P2l0=P2_l,a0=i_admm)['J2_kf_admm']
         g          += [self.ql_fn(scxl0=Xk)['norm_qlf']]
         self.lbg2  += [1]
         self.ubg2  += [1]
-        # add inequality tension magnitude safe constraints
+        po1         = self.po1_fn(scxl0=Xk,scWl0=Wk,tm0=Tk)['po1f_admm']
+        g          += [po1]
+        self.lbg2  += [1e-2]
+        self.ubg2  += [1e4] # add an upbound for numerical stability
+        po2         = self.po2_fn(scxl0=Xk,scWl0=Wk,tm0=Tk)['po2f_admm']
+        g          += [po2]
+        self.lbg2  += [1e-2]
+        self.ubg2  += [1e4] # add an upbound for numerical stability
+        # add inequality obstacle-avoidance constraints
         for i in range(int(self.nq)):
             ti_k= self.Ti_admm[i](scxl0=Xk,scWl0=Wk,tm0=Tk)['t'+str(i)+'f_admm']
             g  += [ti_k]
             self.lbg2 += [self.t_min**2] # to prevent it from being slack
             self.ubg2 += [self.t_max**2]
-        # add inequality obstacle-avoidance constraints
-        for i in range(int(self.nq)):
             gi1 = self.Gi1_admm[i](scxl0=Xk,scWl0=Wk,tm0=Tk)['go1'+str(i)+'f_admm']
             g += [gi1]
             self.lbg2 += [1e-2]
@@ -534,13 +567,18 @@ class MPC_Planner:
             g += [gi2]
             self.lbg2 += [1e-2]
             self.ubg2 += [1e4] # add an upbound for numerical stability
-
+            gio = self.Gio_admm[i](scxl0=Xk,scWl0=Wk,tm0=Tk)['dir'+str(i)+'f_admm']
+            g += [gio]
+            self.lbg2 += [-self.rl]
+            self.ubg2 += [self.rl+self.cl0] # add an upbound for numerical stability
+           
         # add inequality safe inter-robot constraints
         for i in range(len(self.Gij_admm)):
             gij = self.Gij_admm[i](scxl0=Xk,scWl0=Wk,tm0=Tk)['g'+str(i)+'f_admm']
             g += [gij]
             self.lbg2 += [1e-2]
             self.ubg2 += [1e4] # add an upbound for numerical stability
+            
           
         # create an NLP solver and solve it
         opts = {}
@@ -548,9 +586,9 @@ class MPC_Planner:
         opts['ipopt.print_level'] = 0
         opts['print_time'] = 0
         opts['ipopt.warm_start_init_point']='yes'
-        opts['ipopt.max_iter']=1e3
+        opts['ipopt.max_iter']=2e3
         opts['ipopt.acceptable_tol']=1e-8
-        opts['ipopt.mu_strategy']='adaptive'
+        # opts['ipopt.mu_strategy']='adaptive'
         
         prob = {'f': J, 
                 'x': vertcat(*w), 
@@ -561,37 +599,36 @@ class MPC_Planner:
         # self.solver2 = nlpsol('solver', 'sqpmethod', prob, opts) 
     
     def ADMM_SubP2(self,P2l):
-        P2_l     = P2l[0:self.n_P2]
-        p1       = P2l[self.n_P2+2*self.N*self.n_xl+2*self.N*self.n_Wl+self.N*self.n_nv]
+        P1_l     = P2l[0:self.n_P1]
+        P2_l     = P2l[self.n_P1:self.n_P1+self.n_P2]
         i_admm   = P2l[-1]
         sc_xl_traj = np.zeros((self.N,self.n_xl))
         sc_Wl_traj = np.zeros((self.N,self.n_Wl))
         Tl_traj    = np.zeros((self.N,self.n_nv))
-        ctrl_traj  = np.zeros((self.N,self.n_ul))
         for k in range(self.N):
             X0 = []
             W0 = []
             T0 = []
             self.w02  = [] # initial guess list of optimal trajectory 
-            xl_k        = P2l[(self.n_P2+k*self.n_xl):(self.n_P2+(k+1)*self.n_xl)]
+            xl_k        = P2l[(self.n_P1+self.n_P2+k*self.n_xl):(self.n_P1+self.n_P2+(k+1)*self.n_xl)]
             for i in range(self.n_xl):
                 X0 += [xl_k[i]]
             self.w02 += X0
-            xL_k        = P2l[(self.n_P2+self.N*self.n_xl+k*self.n_xl):(self.n_P2+self.N*self.n_xl+(k+1)*self.n_xl)]
-            Wl_k        = P2l[(self.n_P2+2*self.N*self.n_xl+k*self.n_Wl):(self.n_P2+2*self.N*self.n_xl+(k+1)*self.n_Wl)]
+            xL_k        = P2l[(self.n_P1+self.n_P2+self.N*self.n_xl+k*self.n_xl):(self.n_P1+self.n_P2+self.N*self.n_xl+(k+1)*self.n_xl)]
+            Wl_k        = P2l[(self.n_P1+self.n_P2+2*self.N*self.n_xl+k*self.n_Wl):(self.n_P1+self.n_P2+2*self.N*self.n_xl+(k+1)*self.n_Wl)]
             for i in range(self.n_Wl):
                 W0 += [Wl_k[i]]
             self.w02 += W0
-            WL_k        = P2l[(self.n_P2+2*self.N*self.n_xl+self.N*self.n_Wl+k*self.n_Wl):(self.n_P2+2*self.N*self.n_xl+self.N*self.n_Wl+(k+1)*self.n_Wl)]
-            Tl_0k       = P2l[(self.n_P2+2*self.N*self.n_xl+2*self.N*self.n_Wl+k*self.n_nv):(self.n_P2+2*self.N*self.n_xl+2*self.N*self.n_Wl+(k+1)*self.n_nv)]
+            WL_k        = P2l[(self.n_P1+self.n_P2+2*self.N*self.n_xl+self.N*self.n_Wl+k*self.n_Wl):(self.n_P1+self.n_P2+2*self.N*self.n_xl+self.N*self.n_Wl+(k+1)*self.n_Wl)]
+            Tl_0k       = P2l[(self.n_P1+self.n_P2+2*self.N*self.n_xl+2*self.N*self.n_Wl+k*self.n_nv):(self.n_P1+self.n_P2+2*self.N*self.n_xl+2*self.N*self.n_Wl+(k+1)*self.n_nv)]
             for i in range(self.n_nv):
                 T0 += [Tl_0k[i]]
             self.w02   += T0
-            para2       = np.concatenate((P2_l,xl_k))
+            para2       = np.concatenate((P1_l,P2_l))
+            para2       = np.concatenate((para2,xl_k))
             para2       = np.concatenate((para2,xL_k))
             para2       = np.concatenate((para2,Wl_k))
             para2       = np.concatenate((para2,WL_k))
-            para2       = np.concatenate((para2,[p1]))
             para2       = np.concatenate((para2,[i_admm]))
             # Solve the NLP
 
@@ -608,17 +645,16 @@ class MPC_Planner:
             state_traj_opt = sol_traj[:, 0:self.n_xl]
             Wl_traj_opt    = sol_traj[:, self.n_xl:(self.n_xl+self.n_Wl)]
             Tl_traj_opt    = sol_traj[:, (self.n_xl+self.n_Wl):]
-            control_traj_opt = sol_traj[:, self.n_xl:]
             sc_xl_traj[k:k+1,:] = state_traj_opt
             sc_Wl_traj[k:k+1,:] = Wl_traj_opt
             Tl_traj[k:k+1,:]    = Tl_traj_opt
-            ctrl_traj[k:k+1,:]  = control_traj_opt
+         
 
         # output
         opt_sol2 = {"scxl_opt":sc_xl_traj,
                    "scWl_opt":sc_Wl_traj,
-                   "Tl_opt":Tl_traj,
-                  "ul_opt":ctrl_traj
+                   "Tl_opt":Tl_traj
+                 
                   }
         return opt_sol2 
     
@@ -634,17 +670,17 @@ class MPC_Planner:
         self.Lnv_o        = jacobian(self.J2_k_orig,self.nv)
         # hessians
         self.Lscxlscxl    = jacobian(self.Lscxl,self.sc_xl)
-        self.Lscxlscxl_fn = Function('Lscxlscxl',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.Lscxlscxl],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['Lscxlscxlf']) 
+        self.Lscxlscxl_fn = Function('Lscxlscxl',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.Lscxlscxl],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['Lscxlscxlf']) 
         self.LscxlscWl    = jacobian(self.Lscxl,self.sc_Wl)
-        self.LscxlscWl_fn = Function('LscxlscWl',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.LscxlscWl],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['LscxlscWlf'])
+        self.LscxlscWl_fn = Function('LscxlscWl',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.LscxlscWl],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['LscxlscWlf'])
         self.Lscxlnv      = jacobian(self.Lscxl,self.nv)
-        self.Lscxlnv_fn   = Function('Lscxlnv',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.Lscxlnv],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['Lscxlnvf'])
+        self.Lscxlnv_fn   = Function('Lscxlnv',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.Lscxlnv],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['Lscxlnvf'])
         self.LscWlscWl    = jacobian(self.LscWl,self.sc_Wl)
-        self.LscWlscWl_fn = Function('LscWlscWl',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.LscWlscWl],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['LscWlscWlf'])
+        self.LscWlscWl_fn = Function('LscWlscWl',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.LscWlscWl],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['LscWlscWlf'])
         self.LscWlnv      = jacobian(self.LscWl,self.nv)
-        self.LscWlnv_fn   = Function('LscWlnv',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.LscWlnv],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['LscWlnvf'])
+        self.LscWlnv_fn   = Function('LscWlnv',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.LscWlnv],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['LscWlnvf'])
         self.Lnvnv        = jacobian(self.Lnv,self.nv)
-        self.Lnvnv_fn     = Function('Lnvnv',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.Lnvnv],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['Lnvnvf'])
+        self.Lnvnv_fn     = Function('Lnvnv',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.Lnvnv],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['Lnvnvf'])
         # hessians of the original Lagrangian
         self.Lscxlscxl_o   = jacobian(self.Lscxl_o,self.sc_xl)
         self.Lscxlscxl_fno = Function('Lscxlscxlo',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l],[self.Lscxlscxl_o],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0'],['Lscxlscxlof']) 
@@ -661,14 +697,14 @@ class MPC_Planner:
         
         # hessians w.r.t. the hyperparameters
         self.Lscxlp       = jacobian(self.Lscxl,self.P_auto)
-        self.Lscxlp_fn    = Function('Lscxlp',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.Lscxlp],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['Lscxlpf'])
+        self.Lscxlp_fn    = Function('Lscxlp',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.Lscxlp],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['Lscxlpf'])
         self.LscWlp       = jacobian(self.LscWl,self.P_auto)
-        self.LscWlp_fn    = Function('LscWlp',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.LscWlp],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['LscWlpf'])
+        self.LscWlp_fn    = Function('LscWlp',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.LscWlp],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['LscWlpf'])
         self.Lnvp         = jacobian(self.Lnv,self.P_auto)
-        self.Lnvp_fn      = Function('Lnvp',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P2_l, self.p1, self.a],[self.Lnvp],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P2l0', 'p10', 'a0'],['Lnvpf'])
+        self.Lnvp_fn      = Function('Lnvp',[self.nv, self.xl, self.Wl, self.sc_xl, self.sc_xL, self.sc_Wl, self.sc_WL, self.P1_l, self.P2_l, self.a],[self.Lnvp],['nv0', 'xl0', 'Wl0', 'scxl0', 'scxL0', 'scWl0', 'scWL0', 'P1l0', 'P2l0', 'a0'],['Lnvpf'])
 
 
-    def Get_AuxSys_SubP2(self,opt_sol1,opt_sol2,scxL_opt,scWL_opt,weight2,p1,i_admm):
+    def Get_AuxSys_SubP2(self,opt_sol1,opt_sol2,scxL_opt,scWL_opt,weight1,weight2,i_admm):
         xl_opt   = opt_sol1['xl_opt']
         Wl_opt   = opt_sol1['Wl_opt']
         scxl_opt = opt_sol2['scxl_opt']
@@ -691,15 +727,15 @@ class MPC_Planner:
         LscWlnv_lo        = self.N*[np.zeros((self.n_Wl,self.n_nv))]
         Lnvnv_lo          = self.N*[np.zeros((self.n_nv,self.n_nv))]
         for k in range(self.N):
-            Lscxlscxl_l[k] = self.Lscxlscxl_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['Lscxlscxlf'].full()
-            LscxlscWl_l[k] = self.LscxlscWl_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['LscxlscWlf'].full()
-            Lscxlnv_l[k]   = self.Lscxlnv_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['Lscxlnvf'].full()
-            LscWlscWl_l[k] = self.LscWlscWl_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['LscWlscWlf'].full()
-            LscWlnv_l[k]   = self.LscWlnv_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['LscWlnvf'].full()
-            Lnvnv_l[k]     = self.Lnvnv_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['Lnvnvf'].full()
-            Lscxlp_l[k]    = self.Lscxlp_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['Lscxlpf'].full()
-            LscWlp_l[k]    = self.LscWlp_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['LscWlpf'].full()
-            Lnvp_l[k]      = self.Lnvp_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2,p10=p1,a0=i_admm)['Lnvpf'].full()
+            Lscxlscxl_l[k] = self.Lscxlscxl_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['Lscxlscxlf'].full()
+            LscxlscWl_l[k] = self.LscxlscWl_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['LscxlscWlf'].full()
+            Lscxlnv_l[k]   = self.Lscxlnv_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['Lscxlnvf'].full()
+            LscWlscWl_l[k] = self.LscWlscWl_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['LscWlscWlf'].full()
+            LscWlnv_l[k]   = self.LscWlnv_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['LscWlnvf'].full()
+            Lnvnv_l[k]     = self.Lnvnv_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['Lnvnvf'].full()
+            Lscxlp_l[k]    = self.Lscxlp_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['Lscxlpf'].full()
+            LscWlp_l[k]    = self.LscWlp_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['LscWlpf'].full()
+            Lnvp_l[k]      = self.Lnvp_fn(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P1l0=weight1,P2l0=weight2,a0=i_admm)['Lnvpf'].full()
             # hessians of the original Lagrangian
             Lscxlscxl_lo[k] = self.Lscxlscxl_fno(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2)['Lscxlscxlof'].full()
             LscxlscWl_lo[k] = self.LscxlscWl_fno(nv0=Tl_opt[k,:],xl0=xl_opt[k,:],Wl0=Wl_opt[k,:],scxl0=scxl_opt[k,:],scxL0=scxL_opt[:,k],scWl0=scWl_opt[k,:],scWL0=scWL_opt[:,k],P2l0=weight2)['LscxlscWlof'].full()
@@ -727,10 +763,11 @@ class MPC_Planner:
         return auxSys2
     
 
-    def ADMM_SubP3(self,xL_opt,WL_opt,xl_opt,scxl_opt,Wl_opt,scWl_opt,p1,i_admm):
+    def ADMM_SubP3(self,xL_opt,WL_opt,xl_opt,scxl_opt,Wl_opt,scWl_opt,px,pu,gammax,gammau,ADMM_max,i_admm):
         Y_new   = np.zeros((self.n_xl,self.N))
         Eta_new = np.zeros((self.n_Wl,self.N))
-        dis_rn  = self.Discount_rate(i_admm) # the numerical value of the iteration-specific ADMM penalty parameter
+        px_dis        = self.open_loop_penalty(px,gammax,i_admm,ADMM_max)
+        pu_dis        = self.open_loop_penalty(pu,gammau,i_admm,ADMM_max)
         for k in range(self.N):
             y_k        = np.reshape(xL_opt[:,k],(self.n_xl,1)) # old Lagrangian multiplier associated with the safe copy state
             xl_k       = np.reshape(xl_opt[k,:],(self.n_xl,1))
@@ -738,8 +775,8 @@ class MPC_Planner:
             eta_k      = np.reshape(WL_opt[:,k],(self.n_Wl,1)) # old Lagrangian multiplier associated with the safe copy control
             Wl_k       = np.reshape(Wl_opt[k,:],(self.n_Wl,1))
             scWl_k     = np.reshape(scWl_opt[k,:],(self.n_Wl,1))
-            y_k_new    = y_k + dis_rn*p1*(xl_k - scxl_k)
-            eta_k_new  = eta_k + dis_rn*p1*(Wl_k - scWl_k)
+            y_k_new    = y_k + px_dis*(xl_k - scxl_k)
+            eta_k_new  = eta_k + pu_dis*(Wl_k - scWl_k)
             Y_new[:,k:k+1] = y_k_new
             Eta_new[:,k:k+1] = eta_k_new
 
@@ -747,24 +784,24 @@ class MPC_Planner:
     
 
     def system_derivatives_SubP3_ADMM(self):
-        scxl_update = self.dis_r*self.p1*(self.xl - self.sc_xl)
-        scWl_update = self.dis_r*self.p1*(self.Wl - self.sc_Wl)
+        scxl_update = self.px_dis*(self.xl - self.sc_xl)
+        scWl_update = self.pu_dis*(self.Wl - self.sc_Wl)
         self.dscxl_updatedp = jacobian(scxl_update,self.P_auto)
-        self.dscxl_updatedp_fn = Function('dscxl_update',[self.xl,self.sc_xl,self.a],[self.dscxl_updatedp],['xl0','scxl0','a0'],['dscxl_updatef'])
+        self.dscxl_updatedp_fn = Function('dscxl_update',[self.xl,self.sc_xl,self.P1_l,self.a],[self.dscxl_updatedp],['xl0','scxl0','P1l0','a0'],['dscxl_updatef'])
         self.dscWl_updatedp = jacobian(scWl_update,self.P_auto)
-        self.dscWl_updatedp_fn = Function('dscWl_update',[self.Wl,self.sc_Wl,self.a],[self.dscWl_updatedp],['Wl0','scWl0','a0'],['dscWl_updatef'])
+        self.dscWl_updatedp_fn = Function('dscWl_update',[self.Wl,self.sc_Wl,self.P1_l,self.a],[self.dscWl_updatedp],['Wl0','scWl0','P1l0','a0'],['dscWl_updatef'])
 
 
-    def Get_AuxSys_SubP3(self,opt_sol1,opt_sol2,i_admm):
+    def Get_AuxSys_SubP3(self,opt_sol1,opt_sol2,weight1,i_admm):
         xl_opt   = opt_sol1['xl_opt']
         Wl_opt   = opt_sol1['Wl_opt']
         scxl_opt = opt_sol2['scxl_opt']
         scWl_opt = opt_sol2['scWl_opt']
-        dscxl_updatedp_l = self.N*[self.n_xl,self.n_Pauto]
-        dscWl_updatedp_l = self.N*[self.n_Wl,self.n_Pauto]
+        dscxl_updatedp_l = self.N * [np.zeros((self.n_xl, self.n_Pauto))]
+        dscWl_updatedp_l = self.N * [np.zeros((self.n_Wl, self.n_Pauto))]
         for k in range(self.N):
-            dscxl_updatedp_l[k] = self.dscxl_updatedp_fn(xl0=xl_opt[k,:],scxl0=scxl_opt[k,:],a0=i_admm)['dscxl_updatef'].full()
-            dscWl_updatedp_l[k] = self.dscWl_updatedp_fn(Wl0=Wl_opt[k,:],scWl0=scWl_opt[k,:],a0=i_admm)['dscWl_updatef'].full()
+            dscxl_updatedp_l[k] = self.dscxl_updatedp_fn(xl0=xl_opt[k,:],scxl0=scxl_opt[k,:],P1l0=weight1,a0=i_admm)['dscxl_updatef'].full()
+            dscWl_updatedp_l[k] = self.dscWl_updatedp_fn(Wl0=Wl_opt[k,:],scWl0=scWl_opt[k,:],P1l0=weight1,a0=i_admm)['dscWl_updatef'].full()
         
         auxSys3 = {
                     "dscxl_updp":dscxl_updatedp_l,
@@ -773,7 +810,7 @@ class MPC_Planner:
         return auxSys3
 
 
-    def ADMM_forward_MPC_DDP(self,xl_fb,Ref_xl,Ref_Wl,weight1,weight2,p1,max_iter_ADMM,adaptiveADMM):
+    def ADMM_forward_MPC_DDP(self,xl_fb,Ref_xl,Ref_Wl,weight1,weight2,max_iter_ADMM):
         r_primal = 1e2 # primal residual
         r_dual   = 1e2 # dual residual
         max_iter_DDP = 10
@@ -781,17 +818,18 @@ class MPC_Planner:
         xl_traj  = Ref_xl[0:self.N*self.n_xl]
         Wl_traj  = Ref_Wl
         xw       = np.concatenate((xl_traj,Wl_traj)) # collection of all local states and controls
-        scxl_opt1 = np.zeros(((self.N)*self.n_xl)) # this initial guess is very important, the worse the initial guess, the larger the initial loss!
+        scxl_opt1 = np.zeros(((self.N+1)*self.n_xl)) # this initial guess is very important, the worse the initial guess, the larger the initial loss!
         scWl_opt = np.zeros((self.N*self.n_Wl)) # this initial guess is very important
         for k in range(self.N):
             u_k    = np.reshape(Ref_Wl[k*self.n_Wl:(k+1)*self.n_Wl],(self.n_Wl,1)) # this initial guess is very important
-            scxl_opt1[(k)*self.n_xl:(k+1)*self.n_xl] = np.reshape(self.MDynl_fn_admm(xl0=scxl_opt1[k*self.n_xl:(k+1)*self.n_xl],Wl0=u_k)['MDynlf_admm'].full(),self.n_xl)
+            # scxl_opt1[(k)*self.n_xl:(k+1)*self.n_xl] = Ref_xl[(k)*self.n_xl:(k+1)*self.n_xl]
+            scxl_opt1[(k)*self.n_xl:(k+1)*self.n_xl] = np.reshape(self.MDynl_fn_admm(xl0=scxl_opt1[k*self.n_xl:(k+1)*self.n_xl],Wl0=u_k)['MDynlf_admm'].full(),self.n_xl) # start from a bad guess
             scWl_opt[k*self.n_Wl:(k+1)*self.n_Wl] = np.reshape(u_k,self.n_Wl)
         scxl_opt = scxl_opt1[0:self.N*self.n_xl]
         sc_xw    = np.concatenate((scxl_opt,scWl_opt)) # collection of all local safe copy states and controls
         norm_xw  = np.array([LA.norm(xw),LA.norm(sc_xw)])
         e_pri    = np.sqrt(2)*self.e_abs + self.e_rel * np.max(norm_xw)
-        e_dual   = np.sqrt(2)*self.e_abs + self.e_rel * (p1*LA.norm(scxl_opt)+p1*LA.norm(scWl_opt))
+        
         Y        = np.zeros((self.n_xl,self.N)) # Lagrangian multiplier trajectory associated with the safe copy state
         Eta      = np.zeros((self.n_Wl,self.N)) # Lagrangian multiplier trajectory associated with the safe copy control
         self.max_iter_ADMM = max_iter_ADMM
@@ -803,13 +841,11 @@ class MPC_Planner:
         Tl0      = np.zeros(self.N*(3*int(self.nq)-6))
         i        = 0
         for i_admm in range(int(self.max_iter_ADMM)):
-            if adaptiveADMM == 'f':
-                i_admm = 1e2 # a very large i_admm makes the sigmoid function almost 1
             Y_l   = np.reshape(Y.T,self.N*self.n_xl) # old state Lagrangian multiplier trajectory
             Eta_l = np.reshape(Eta.T,self.N*self.n_Wl) # old control Lagrangian multiplier trajectory
             # solve Subproblem 1
             start_time = TM.time()
-            opt_sol1   = self.DDP_ADMM_Subp1(xl_fb,Ref_xl,Ref_Wl,weight1,scxl_opt,scWl_opt,Y_l,Eta_l,p1,max_iter_DDP,e_tol,i,i_admm)
+            opt_sol1   = self.DDP_ADMM_Subp1(xl_fb,Ref_xl,Ref_Wl,weight1,scxl_opt,scWl_opt,Y_l,Eta_l,max_iter_DDP,e_tol,i_admm)
             mpctime    = (TM.time() - start_time)*1000
             print("subprblem1:--- %s ms ---" % format(mpctime,'.2f'))
             xl_opt   = opt_sol1['xl_opt']
@@ -818,12 +854,12 @@ class MPC_Planner:
             Wl_opt   = opt_sol1['Wl_opt']
             Wl_traj  = np.reshape(Wl_opt,self.N*self.n_Wl)
             # solve Subproblem 2
-            para2    = np.concatenate((weight2,xl_traj))
+            para2    = np.concatenate((weight1,weight2))
+            para2    = np.concatenate((para2,xl_traj))
             para2    = np.concatenate((para2,Y_l))
             para2    = np.concatenate((para2,Wl_traj))
             para2    = np.concatenate((para2,Eta_l))
             para2    = np.concatenate((para2,Tl0))
-            para2    = np.concatenate((para2,[p1]))
             para2    = np.concatenate((para2,[i_admm]))
             start_time = TM.time()
             opt_sol2 = self.ADMM_SubP2(para2)
@@ -833,12 +869,14 @@ class MPC_Planner:
             scWl_traj= np.reshape(opt_sol2['scWl_opt'],self.N*self.n_Wl) # new safe copy control trajectory
             # solve Subproblem 3
             Y_new, Eta_new   = self.ADMM_SubP3(Y,Eta,np.reshape(xl_traj,(self.N,self.n_xl)),np.reshape(scxl_traj,(self.N,self.n_xl)),
-                                       np.reshape(Wl_traj,(self.N,self.n_Wl)),np.reshape(scWl_traj,(self.N,self.n_Wl)),p1,i_admm)
+                                       np.reshape(Wl_traj,(self.N,self.n_Wl)),np.reshape(scWl_traj,(self.N,self.n_Wl)),weight1[-4],weight1[-3],weight1[-2],weight1[-1],max_iter_ADMM,i_admm)
             # compute residual (for adaptive penalty parameters)
+            px_dis      = self.open_loop_penalty(weight1[-4],weight1[-2],i_admm,max_iter_ADMM)
+            pu_dis      = self.open_loop_penalty(weight1[-3],weight1[-1],i_admm,max_iter_ADMM)
             r_px        = LA.norm(xl_traj-scxl_traj)
-            r_dx        = LA.norm(p1*(scxl_traj-scxl_opt))
+            r_dx        = LA.norm(px_dis*(scxl_traj-scxl_opt))
             r_pw        = LA.norm(Wl_traj-scWl_traj)
-            r_dw        = LA.norm(p1*(scWl_traj-scWl_opt))
+            r_dw        = LA.norm(pu_dis*(scWl_traj-scWl_opt))
             r_primal    = np.sqrt(r_px**2+r_pw**2)
             r_dual      = np.sqrt(r_dx**2+r_dw**2)
             # update the safe copy trajectories, Lagrangian multipliers, and error
@@ -850,9 +888,9 @@ class MPC_Planner:
             xw        = np.concatenate((xl_traj,Wl_traj))
             norm_xw   = np.array([LA.norm(xw),LA.norm(sc_xw)])
             e_pri     = np.sqrt(2)*self.e_abs + self.e_rel * np.max(norm_xw)
-            e_dual    = np.sqrt(2)*self.e_abs + self.e_rel * (p1*LA.norm(scxl_opt)+p1*LA.norm(scWl_opt))
-            dis_rn    = self.Discount_rate(i_admm)
-            print('ADMM iteration:',i+1,'r_primal=',r_primal,'r_dual=',r_dual,'e_pri=',e_pri,'e_dual=',e_dual,'current_p1=',dis_rn*p1)
+            e_dual    = np.sqrt(2)*self.e_abs + self.e_rel * (px_dis*LA.norm(scxl_opt)+pu_dis*LA.norm(scWl_opt))
+            
+            print('ADMM iteration:',i+1,'r_primal=',r_primal,'r_dual=',r_dual,'e_pri=',e_pri,'e_dual=',e_dual,'current_px=',px_dis,'current_gammax=',weight1[-2],'current_pu=',pu_dis,'current_gammau=',weight1[-1])
             Opt_Sol1 += [opt_sol1]
             Opt_Sol2 += [opt_sol2]
             Opt_Y    += [Y]
@@ -863,7 +901,7 @@ class MPC_Planner:
 
         return Opt_Sol1, Opt_Sol2, Opt_Y, Opt_Eta
     
-    def DDP_Gradient(self,opt_sol,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, p1, i_admm):
+    def DDP_Gradient(self,opt_sol,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, px,pu, gammax,gammau,ADMM_max,i_admm):
         Quuinv, Qxu, K_fb, F, G  = opt_sol['Quu_inv'], opt_sol['Qxu'], opt_sol['K_FB'], opt_sol['Fx'], opt_sol['Fu']
         HxNp, Hxp, Hup = auxSys1['HxNp'], auxSys1['Hxp'], auxSys1['Hup']
         S          = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))]
@@ -871,13 +909,15 @@ class MPC_Planner:
         v_FF       = self.N*[np.zeros((self.n_Wl,self.n_Pauto))]
         xl_grad    = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))] 
         Wl_grad    = self.N*[np.zeros((self.n_Wl,self.n_Pauto))]
-        dis_rn     = self.Discount_rate(i_admm)
+        px_dis     = self.open_loop_penalty(px,gammax,i_admm,ADMM_max)
+        pu_dis     = self.open_loop_penalty(pu,gammau,i_admm,ADMM_max)
         #-------Backward recursion-------#         
         for k in reversed(range(self.N)): # N-1, N-2,...,0
-            Hxp_k    = Hxp[k] + scxL_grad[k] - dis_rn*p1*scxl_grad[k]
-            Hup_k    = Hup[k] + scWL_grad[k] - dis_rn*p1*scWl_grad[k]
+            Hxp_k    = Hxp[k] + scxL_grad[k] - px_dis*scxl_grad[k]
+            Hup_k    = Hup[k] + scWL_grad[k] - pu_dis*scWl_grad[k]
             v_FF[k]  = -Quuinv[k]@(Hup_k + G[k].T@S[k+1])
-            S[k]     = Hxp_k + F[k].T@S[k+1] + Qxu[k]@v_FF[k] # s[0] not used
+            # S[k]     = Hxp_k + F[k].T@S[k+1] + Qxu[k]@v_FF[k] # s[0] not used
+            S[k]     = Hxp_k + F[k].T@S[k+1] + K_fb[k].T@(Hup_k + G[k].T@S[k+1])
         #-------Forward recursion-------#
         for k in range(self.N):
             Wl_grad[k]  = K_fb[k]@xl_grad[k]+v_FF[k]
@@ -890,7 +930,7 @@ class MPC_Planner:
         return grad_out
     
     
-    def Cao_Gradient_s(self,opt_sol,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, p1, i_admm):
+    def Cao_Gradient_s(self,opt_sol,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, px,pu, gammax,gammau,ADMM_max,i_admm):
         Quuinv, Qxu, K_fb, F, G  = opt_sol['Quu_inv'], opt_sol['Qxu'], opt_sol['K_FB'], opt_sol['Fx'], opt_sol['Fu']
         HxNp, Hxp, Hup = auxSys1['HxNp'], auxSys1['Hxp'], auxSys1['Hup']
         S           = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))] # Vxp
@@ -901,15 +941,17 @@ class MPC_Planner:
         xl_grad     = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))] 
         p_grad      = (self.N+1)*[np.identity(self.n_Pauto)]
         Wl_grad     = self.N*[np.zeros((self.n_Wl,self.n_Pauto))]
-        dis_rn      = self.Discount_rate(i_admm)
+        px_dis      = self.open_loop_penalty(px,gammax,i_admm,ADMM_max)
+        pu_dis      = self.open_loop_penalty(pu,gammau,i_admm,ADMM_max)
         #-------Backward recursion-------#         
         for k in reversed(range(self.N)): # N-1, N-2,...,0
             Hpp_k    = np.zeros((self.n_Pauto,self.n_Pauto))
-            Hxp_k    = Hxp[k] + scxL_grad[k] - dis_rn*p1*scxl_grad[k]
-            Hup_k    = Hup[k] + scWL_grad[k] - dis_rn*p1*scWl_grad[k]
+            Hxp_k    = Hxp[k] + scxL_grad[k] - px_dis*scxl_grad[k]
+            Hup_k    = Hup[k] + scWL_grad[k] - pu_dis*scWl_grad[k]
             v_FF[k]  = -Quuinv[k]@(Hup_k + G[k].T@S[k+1])
             Vpp[k]   = Hpp_k + Vpp[k+1] + (Hup_k + G[k].T@S[k+1]).T@v_FF[k] # the augmented Riccati recursion, which is redundant
-            S[k]     = Hxp_k + F[k].T@S[k+1] + Qxu[k]@v_FF[k] # s[0] not used
+            # S[k]     = Hxp_k + F[k].T@S[k+1] + Qxu[k]@v_FF[k] # s[0] not used
+            S[k]     = Hxp_k + F[k].T@S[k+1] + K_fb[k].T@(Hup_k + G[k].T@S[k+1]) # s[0] not used
         #-------Foreward recursion-------#
         for k in range(self.N):
             Wl_grad[k]  = K_fb[k]@xl_grad[k]+v_FF[k]@p_grad[k] # expanding the augmented control law gives this form, which is exactly the same as ours
@@ -924,7 +966,7 @@ class MPC_Planner:
         return grad_out_cao
     
 
-    def Cao_Gradient(self,opt_sol,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad,p1,i_admm):
+    def Cao_Gradient(self,opt_sol,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad,px,pu,gammax,gammau,ADMM_max,i_admm):
         # solve the augmented optimal problem using one-step DDP recursion
         Hxx, Hxu, Huu, F, G = opt_sol['Hxx'], opt_sol['Hxu'], opt_sol['Huu'], opt_sol['Fx'], opt_sol['Fu']
         HxxN, HxNp, Hxp, Hup = auxSys1['HxxN'], auxSys1['HxNp'], auxSys1['Hxp'], auxSys1['Hup']
@@ -948,7 +990,8 @@ class MPC_Planner:
         Vpx[self.N] = HxNp.T
         Vxp[self.N] = HxNp
         Vxx[self.N] = HxxN
-        dis_rn      = self.Discount_rate(i_admm)
+        px_dis      = self.open_loop_penalty(px,gammax,i_admm,ADMM_max)
+        pu_dis      = self.open_loop_penalty(pu,gammau,i_admm,ADMM_max)
         Iu          = np.identity(self.n_Wl)
         for k in reversed(range(self.N)):
             # Hyy_k   = vertcat(
@@ -967,10 +1010,10 @@ class MPC_Planner:
             # Kfb_y[k]=-LA.inv(Quu_k)@Quy_k
             # Vyy[k]  = Qyy_k + Quy_k.T@Kfb_y[k]
             # Hpp_k    = np.zeros((self.n_Pauto,self.n_Pauto))
-            Hpx_k    = (Hxp[k]+ scxL_grad[k] - dis_rn*p1*scxl_grad[k]).T
+            Hpx_k    = (Hxp[k]+ scxL_grad[k] - px_dis*scxl_grad[k]).T
             # Hxp_k    = Hxp[k]+ scxL_grad[k] - dis_rn*p1*scxl_grad[k]
             Hxx_k    = Hxx[k]
-            Hup_k    = Hup[k]+ scWL_grad[k] - dis_rn*p1*scWl_grad[k]
+            Hup_k    = Hup[k]+ scWL_grad[k] - pu_dis*scWl_grad[k]
             Quu_k    = Huu[k]+G[k].T@Vxx[k+1]@G[k]
             # invQuu_k = LA.solve(Quu_k,Iu) 
             invQuu_k = LA.inv(Quu_k)
@@ -994,23 +1037,24 @@ class MPC_Planner:
         return grad_out_cao
 
 
-    def PDP_Gradient(self,auxsys_No,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, p1, i_admm):
+    def PDP_Gradient(self,auxsys_No,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, px,pu, gammax,gammau,ADMM_max,i_admm):
         Hxx, Hxu, Huu, F, G  = auxsys_No['Hxx'], auxsys_No['Hxu'], auxsys_No['Huu'], auxsys_No['Fx'], auxsys_No['Fu']
         HxxN, HxNp, Hxp, Hup = auxSys1['HxxN'], auxSys1['HxNp'], auxSys1['Hxp'], auxSys1['Hup']
-        P          = (self.N+1)*[np.zeros((self.n_xl,self.n_xl))]
-        S          = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))]
-        A          = self.N*[np.zeros((self.n_xl,self.n_xl))]
-        R          = self.N*[np.zeros((self.n_xl,self.n_xl))]
-        M_p        = self.N*[np.zeros((self.n_xl,self.n_Pauto))]
-        invHuu     = self.N*[np.zeros((self.n_Wl,self.n_Wl))]
-        PinvIRP    = self.N*[np.zeros((self.n_xl,self.n_xl))]
-        P[self.N]  = HxxN
-        S[self.N]  = HxNp
-        xl_grad    = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))] 
-        Wl_grad    = self.N*[np.zeros((self.n_Wl,self.n_Pauto))]
-        I          = np.identity(self.n_xl)
-        Iu         = np.identity(self.n_Wl)
-        dis_rn     = self.Discount_rate(i_admm)
+        P           = (self.N+1)*[np.zeros((self.n_xl,self.n_xl))]
+        S           = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))]
+        A           = self.N*[np.zeros((self.n_xl,self.n_xl))]
+        R           = self.N*[np.zeros((self.n_xl,self.n_xl))]
+        M_p         = self.N*[np.zeros((self.n_xl,self.n_Pauto))]
+        invHuu      = self.N*[np.zeros((self.n_Wl,self.n_Wl))]
+        PinvIRP     = self.N*[np.zeros((self.n_xl,self.n_xl))]
+        P[self.N]   = HxxN
+        S[self.N]   = HxNp
+        xl_grad     = (self.N+1)*[np.zeros((self.n_xl,self.n_Pauto))] 
+        Wl_grad     = self.N*[np.zeros((self.n_Wl,self.n_Pauto))]
+        I           = np.identity(self.n_xl)
+        Iu          = np.identity(self.n_Wl)
+        px_dis      = self.open_loop_penalty(px,gammax,i_admm,ADMM_max)
+        pu_dis      = self.open_loop_penalty(pu,gammau,i_admm,ADMM_max)
         for k in reversed(range(self.N)): # N-1, N-2,...,0
         # for k in range(self.N-1,0,-1):
             P_next = P[k+1]
@@ -1022,9 +1066,9 @@ class MPC_Planner:
             HxuinvHuu   = Hxu[k]@invHuu[k]
             A[k]        = F[k]-GinvHuu@Hxu[k].T
             R[k]        = GinvHuu@G[k].T
-            M_p[k]      = -GinvHuu@(Hup[k]+ scWL_grad[k] - dis_rn*p1*scWl_grad[k])
+            M_p[k]      = -GinvHuu@(Hup[k]+ scWL_grad[k] - pu_dis*scWl_grad[k])
             Q_k         = Hxx[k]-HxuinvHuu@Hxu[k].T
-            N_p_k       = Hxp[k]+ scxL_grad[k] - dis_rn*p1*scxl_grad[k] - HxuinvHuu@(Hup[k]+ scWL_grad[k] - dis_rn*p1*scWl_grad[k])
+            N_p_k       = Hxp[k]+ scxL_grad[k] - px_dis*scxl_grad[k] - HxuinvHuu@(Hup[k]+ scWL_grad[k] - pu_dis*scWl_grad[k])
             # PinvIRP[k]  = LA.solve(IRP.T,P_next.T).T
             PinvIRP[k]  = P_next@LA.inv(I+R[k]@P_next)
             P_curr      = Q_k + A[k].T@PinvIRP[k]@A[k]
@@ -1033,7 +1077,7 @@ class MPC_Planner:
             S[k]        = S_curr
         
         for k in range(self.N):
-            Wl_grad[k]  = -invHuu[k]@((Hxu[k].T + G[k].T@PinvIRP[k]@A[k])@xl_grad[k] + G[k].T@PinvIRP[k]@(M_p[k]- R[k]@ S[k+1]) + G[k].T@S[k+1] + (Hup[k] + scWL_grad[k] - dis_rn*p1*scWl_grad[k]))
+            Wl_grad[k]  = -invHuu[k]@((Hxu[k].T + G[k].T@PinvIRP[k]@A[k])@xl_grad[k] + G[k].T@PinvIRP[k]@(M_p[k]- R[k]@ S[k+1]) + G[k].T@S[k+1] + (Hup[k] + scWL_grad[k] - pu_dis*scWl_grad[k]))
             xl_grad[k+1] = F[k]@xl_grad[k] + G[k]@Wl_grad[k]
 
         grad_out ={"xl_grad":xl_grad,
@@ -1044,7 +1088,7 @@ class MPC_Planner:
     
 
     
-    def SubP2_Gradient(self,auxSys2,grad_out,scxL_grad,scWL_grad,p1,i_admm):
+    def SubP2_Gradient(self,auxSys2,grad_out,scxL_grad,scWL_grad,px,pu,gammax,gammau,ADMM_max,i_admm):
         xl_grad      = grad_out['xl_grad']
         Wl_grad      = grad_out['Wl_grad']
         Lscxlscxl_l, LscxlscWl_l, Lscxlnv_l = auxSys2['Lscxlscxl_l'], auxSys2['LscxlscWl_l'], auxSys2['Lscxlnv_l']
@@ -1060,7 +1104,9 @@ class MPC_Planner:
         nv_grad      = self.N*[np.zeros((self.n_nv,self.n_Pauto))]
         I_xw         = np.identity(self.n_xl+self.n_Wl+self.n_nv) # identity matrix
         MIN_eigen    = []
-        dis_rn       = self.Discount_rate(i_admm)
+        px_dis      = self.open_loop_penalty(px,gammax,i_admm,ADMM_max)
+        pu_dis      = self.open_loop_penalty(pu,gammau,i_admm,ADMM_max)
+        EigTime     = 0
         for k in range(self.N):
             L_hessian_k = vertcat(
                             horzcat(Lscxlscxl_l[k],  LscxlscWl_l[k],Lscxlnv_l[k]),
@@ -1068,8 +1114,8 @@ class MPC_Planner:
                             horzcat(Lscxlnv_l[k].T,  LscWlnv_l[k].T,Lnvnv_l[k])
                             )
             L_trajp_k   = vertcat(
-                            Lscxlp_l[k] - scxL_grad[k] - dis_rn*p1*xl_grad[k],
-                            LscWlp_l[k] - scWL_grad[k] - dis_rn*p1*Wl_grad[k],
+                            Lscxlp_l[k] - scxL_grad[k] - px_dis*xl_grad[k],
+                            LscWlp_l[k] - scWL_grad[k] - pu_dis*Wl_grad[k],
                             Lnvp_l[k]
                             )
             L_hessian_ko = vertcat(
@@ -1077,8 +1123,11 @@ class MPC_Planner:
                             horzcat(LscxlscWl_lo[k].T,LscWlscWl_lo[k],LscWlnv_lo[k]),
                             horzcat(Lscxlnv_lo[k].T,  LscWlnv_lo[k].T,Lnvnv_lo[k])
                             )
+            start_time = TM.time()
             min_eigval = np.min(LA.eigvalsh(L_hessian_ko))
-            
+            eigtime    = (TM.time() - start_time)*1000
+            EigTime   += eigtime
+            # print('ADMM iteration:',i_admm+1,"eig_time:--- %s ms ---" % format(eigtime,'.2f'))
             MIN_eigen += [min_eigval]
            
             if min_eigval<0:
@@ -1091,7 +1140,8 @@ class MPC_Planner:
             scxl_grad[k] = grad_subp2_k[0:self.n_xl,:]
             scWl_grad[k] = grad_subp2_k[self.n_xl:(self.n_xl+self.n_Wl),:]
             nv_grad[k]   = grad_subp2_k[(self.n_xl+self.n_Wl):,:]
-        print('min_eigen=',np.min(MIN_eigen))    
+        print('min_eigen=',np.min(MIN_eigen))   
+        print('ADMM iteration:',i_admm+1,"eig_time:--- %s ms ---" % format(EigTime,'.2f')) 
         grad_out2 = {"scxl_grad":scxl_grad,
                      "scWl_grad":scWl_grad,
                      "nv_grad":nv_grad
@@ -1099,7 +1149,7 @@ class MPC_Planner:
         return grad_out2
     
         
-    def SubP3_Gradient(self,auxSys3,grad_out,grad_out2,scxL_grad,scWL_grad,p1,i_admm):
+    def SubP3_Gradient(self,auxSys3,grad_out,grad_out2,scxL_grad,scWL_grad,px,pu,gammax,gammau,ADMM_max,i_admm):
         xl_grad      = grad_out['xl_grad']
         Wl_grad      = grad_out['Wl_grad']
         scxl_grad    = grad_out2['scxl_grad']
@@ -1108,12 +1158,13 @@ class MPC_Planner:
         dscWl_updp   = auxSys3['dscWl_updp']
         Y_grad_new   = self.N*[np.zeros((self.n_xl,self.n_Pauto))]
         Eta_grad_new = self.N*[np.zeros((self.n_Wl,self.n_Pauto))]
-        dis_rn       = self.Discount_rate(i_admm)
+        px_dis       = self.open_loop_penalty(px,gammax,i_admm,ADMM_max)
+        pu_dis       = self.open_loop_penalty(pu,gammau,i_admm,ADMM_max)
         for k in range(self.N):
             Y_grad_k   = scxL_grad[k] # old Lagrangian gradient associated with the load's state xl
             Eta_grad_k = scWL_grad[k] # old Lagrangian gradient associated with the load's control Wl
-            Y_grad_new[k]   = Y_grad_k + dis_rn*p1*(xl_grad[k] - scxl_grad[k]) + dscxl_updp[k]
-            Eta_grad_new[k] = Eta_grad_k + dis_rn*p1*(Wl_grad[k] - scWl_grad[k]) + dscWl_updp[k]
+            Y_grad_new[k]   = Y_grad_k + px_dis*(xl_grad[k] - scxl_grad[k]) + dscxl_updp[k]
+            Eta_grad_new[k] = Eta_grad_k + pu_dis*(Wl_grad[k] - scWl_grad[k]) + dscWl_updp[k]
         
         grad_out3 = {
                      "scxL_grad":Y_grad_new,
@@ -1122,7 +1173,7 @@ class MPC_Planner:
         
         return grad_out3
 
-    def ADMM_Gradient_Solver(self,Opt_Sol1,Opt_Sol2,Opt_Y,Opt_Eta,Ref_xl,Ref_Wl,weight1,weight2,p1,adaptiveADMM):
+    def ADMM_Gradient_Solver(self,Opt_Sol1,Opt_Sol2,Opt_Y,Opt_Eta,Ref_xl,Ref_Wl,weight1,weight2):
         # initialize the gradient trajectories of SubP2 and SubP3
         scxl_grad = self.N*[np.zeros((self.n_xl,self.n_Pauto))]
         scWl_grad = self.N*[np.zeros((self.n_Wl,self.n_Pauto))]
@@ -1138,55 +1189,55 @@ class MPC_Planner:
         Y         = np.zeros((self.n_xl,self.N)) # Lagrangian multiplier trajectory associated with the safe copy state
         Eta       = np.zeros((self.n_Wl,self.N)) # Lagrangian multiplier trajectory associated with the safe copy control
         # lists for storing gradient trajectories
-        Grad_Out1     = []
-        Grad_Out2     = []
-        Grad_Out3     = []
-        GradTime      = []
-        GradTimePDP   = []
-        GradTimeCao   =[]
-        GradTimeCaos  =[]
-        MeanerrorCao  = []
-        MeanerrorPDP  = []
-        i             = 0
+        Grad_Out1      = []
+        Grad_Out2      = []
+        Grad_Out3      = []
+        GradTime       = []
+        GradTimePDP    = []
+        GradTimeCao    =[]
+        GradTimeCaos   =[]
+        MeanerrorCao   = []
+        MeanerrorPDP   = []
+        gMeanerror_l   = [] # xl grad residuals
+        i              = 0
         for i_admm in range(int(self.max_iter_ADMM)):
-            if adaptiveADMM == 'f':
-                i_admm = 1e2 # a very large i_admm makes the sigmoid function almost 1
             # gradients of Subproblem1
-            opt_sol1  = Opt_Sol1[i]
-            auxSys1   = self.Get_AuxSys_DDP(opt_sol1, Ref_xl, Ref_Wl, scxl_opt, scWl_opt, Y, Eta,weight1, p1, i_admm)
+            opt_sol1  = Opt_Sol1[i_admm]
+            auxSys1   = self.Get_AuxSys_DDP(opt_sol1, Ref_xl, Ref_Wl, scxl_opt, scWl_opt, Y, Eta,weight1, i_admm)
 
             start_time = TM.time()
-            grad_out  = self.DDP_Gradient(opt_sol1,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, p1, i_admm)
+            grad_out  = self.DDP_Gradient(opt_sol1,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, weight1[-4],weight1[-3],weight1[-2],weight1[-1], int(self.max_iter_ADMM), i_admm)
             gradtimeOur    = (TM.time() - start_time)*1000
             # print('ADMM iteration:',i+1,"g_Our:--- %s ms ---" % format(gradtimeOur,'.2f'))
 
             start_time = TM.time()
-            grad_out_Cao_s = self.Cao_Gradient_s(opt_sol1,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, p1, i_admm)
+            grad_out_Cao_s = self.Cao_Gradient_s(opt_sol1,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, weight1[-4],weight1[-3],weight1[-2],weight1[-1], int(self.max_iter_ADMM),i_admm)
             gradtimeCao_s  = (TM.time() - start_time)*1000
             # print('ADMM iteration:',i+1,"g_Cao_s:--- %s ms ---" % format(gradtimeCao_s,'.2f'))
 
             start_time = TM.time()
-            grad_out_Cao   = self.Cao_Gradient(opt_sol1,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, p1, i_admm)
+            grad_out_Cao   = self.Cao_Gradient(opt_sol1,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, weight1[-4],weight1[-3],weight1[-2],weight1[-1], int(self.max_iter_ADMM), i_admm)
             gradtimeCao    = (TM.time() - start_time)*1000
             # print('ADMM iteration:',i+1,"g_Cao:--- %s ms ---" % format(gradtimeCao,'.2f'))
 
             start_time = TM.time()
-            grad_out_PDP   = self.PDP_Gradient(opt_sol1 ,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, p1, i_admm)
-            gradtimePDP    = (TM.time() - start_time)*1000
+            grad_out_PDP   = self.PDP_Gradient(opt_sol1 ,auxSys1, scxl_grad, scxL_grad, scWl_grad, scWL_grad, weight1[-4],weight1[-3],weight1[-2],weight1[-1], int(self.max_iter_ADMM), i_admm)
+            gradtimePDP    = (TM.time() - start_time)*1000 
             # print('ADMM iteration:',i+1,"g_PDP:--- %s ms ---" % format(gradtimePDP,'.2f'))
 
             # gradients of Subproblem2
-            opt_sol2  = Opt_Sol2[i]
-            auxSys2   = self.Get_AuxSys_SubP2(opt_sol1, opt_sol2, Y, Eta, weight2, p1, i_admm)
-            grad_out2 = self.SubP2_Gradient(auxSys2, grad_out, scxL_grad, scWL_grad, p1, i_admm)
+            opt_sol2  = Opt_Sol2[i_admm]
+            auxSys2   = self.Get_AuxSys_SubP2(opt_sol1, opt_sol2, Y, Eta, weight1, weight2, i_admm)
+            grad_out2 = self.SubP2_Gradient(auxSys2, grad_out, scxL_grad, scWL_grad, weight1[-4],weight1[-3],weight1[-2],weight1[-1], int(self.max_iter_ADMM), i_admm)
             # gradients of Subproblem3
-            auxSys3   = self.Get_AuxSys_SubP3(opt_sol1, opt_sol2, i_admm)
-            grad_out3 = self.SubP3_Gradient(auxSys3, grad_out, grad_out2, scxL_grad, scWL_grad, p1, i_admm)
+            auxSys3   = self.Get_AuxSys_SubP3(opt_sol1, opt_sol2, weight1,i_admm)
+            grad_out3 = self.SubP3_Gradient(auxSys3, grad_out, grad_out2, scxL_grad, scWL_grad, weight1[-4],weight1[-3],weight1[-2],weight1[-1], int(self.max_iter_ADMM), i_admm)
+            
             # update
             scxl_opt  = opt_sol2['scxl_opt']
             scWl_opt  = opt_sol2['scWl_opt']
-            Y         = Opt_Y[i]
-            Eta       = Opt_Eta[i]
+            Y         = Opt_Y[i_admm]
+            Eta       = Opt_Eta[i_admm]
             scxl_grad = grad_out2['scxl_grad']
             scWl_grad = grad_out2['scWl_grad']
             scxL_grad = grad_out3['scxL_grad']
@@ -1210,20 +1261,33 @@ class MPC_Planner:
                 ErrorCao += (LA.norm(error,ord='fro')/LA.norm(xl_grad[j+1],ord='fro'))
                 error2 = xl_grad[j+1] - xl_gradPDP[j+1]
                 ErrorPDP += (LA.norm(error2,ord='fro')/LA.norm(xl_grad[j+1],ord='fro')) # relative error
-                
             meanerrorCao = ErrorCao/self.N
             meanerrorPDP = ErrorPDP/self.N
-            if i == int(self.max_iter_ADMM) -1:
-                print('ADMM iteration:',i+1,"g_Our:--- %s ms ---" % format(gradtimeOur,'.2f'))
-                print('ADMM iteration:',i+1,"g_Cao_s:--- %s ms ---" % format(gradtimeCao_s,'.2f'))
-                print('ADMM iteration:',i+1,"g_Cao:--- %s ms ---" % format(gradtimeCao,'.2f'))
-                print('ADMM iteration:',i+1,"g_PDP:--- %s ms ---" % format(gradtimePDP,'.2f'))
-                print('ADMM iteration:',i+1,'Cao_meanerror=',meanerrorCao,'PDP_meanerror=',meanerrorPDP)
+
+            # primal residuals
+            gError1     = 0
+            gErroru     = 0
+            for k in range(self.N):
+                gerror1 = xl_grad[k] - scxl_grad[k] 
+                gError1 += LA.norm(gerror1,ord='fro')
+                gerroru = grad_out['Wl_grad'][k] - scWl_grad[k]
+                gErroru += LA.norm(gerroru,ord='fro')
+            gmeanerror1 = np.sqrt(gError1**2+gErroru**2)/self.N
+            gMeanerror_l += [gmeanerror1]
+
+            if i_admm == int(self.max_iter_ADMM) -1:
+                print('ADMM iteration:',i_admm+1,"g_Our:--- %s ms ---" % format(gradtimeOur,'.2f'))
+                print('ADMM iteration:',i_admm+1,"g_Cao_s:--- %s ms ---" % format(gradtimeCao_s,'.2f'))
+                print('ADMM iteration:',i_admm+1,"g_Cao:--- %s ms ---" % format(gradtimeCao,'.2f'))
+                print('ADMM iteration:',i_admm+1,"g_PDP:--- %s ms ---" % format(gradtimePDP,'.2f'))
+                print('ADMM iteration:',i_admm+1,'Cao_meanerror=',meanerrorCao,'PDP_meanerror=',meanerrorPDP)
+                gMeanerror_l = [float(x) for x in gMeanerror_l]
+                print('gMeanerror_l=',gMeanerror_l)
             MeanerrorCao += [meanerrorCao]
             MeanerrorPDP += [meanerrorPDP]
-            i      += 1
+           
 
-        return Grad_Out1, Grad_Out2, Grad_Out3, GradTime, GradTimePDP, GradTimeCao, GradTimeCaos, MeanerrorCao, MeanerrorPDP
+        return Grad_Out1, Grad_Out2, Grad_Out3, GradTime, GradTimePDP, GradTimeCao, GradTimeCaos, MeanerrorCao, MeanerrorPDP, gMeanerror_l
 
 
         
@@ -1231,10 +1295,11 @@ class MPC_Planner:
             
 
 class Gradient_Solver:
-    def __init__(self, horizon, xl, Wl, scxl, scWl, P_auto):
+    def __init__(self, horizon, xl, Wl, scxl, scWl, P1_l,P_auto):
         self.n_xl   = xl.numel()
         self.n_Wl   = Wl.numel()
         self.n_P    = P_auto.numel()
+        self.n_P1   = P1_l.numel()
         self.xl     = xl
         self.Wl     = Wl
         self.scxl   = scxl
@@ -1244,6 +1309,8 @@ class Gradient_Solver:
         # boundaries of the hyperparameters
         self.p_min  = 1e-3
         self.p_max  = 1e3
+        self.gamma_min = -3 # 3 for ADMM=3, 2 for ADMMM=4
+        self.gamma_max = 3
         #------------- loss definition -------------#
         # tracking loss
         tracking_error  = self.xl - self.xl_ref
@@ -1253,22 +1320,125 @@ class Gradient_Solver:
         r_primal_w      = self.Wl - self.scWl
         self.loss_rp    = r_primal_x.T@r_primal_x + r_primal_w.T@r_primal_w
    
-    def adaptive_meta_loss_weights(self,loss_t,loss_rp,wt):
-        if loss_t >5*loss_rp:
-            wt_new = np.clip(1.25*wt,0.1,10)
-        elif loss_rp > 5*loss_t:
-            wt_new = np.clip(wt/1.25,0.1,10)
-        else:
-            wt_new = wt
-        return wt_new
+    # def adaptive_meta_loss_weights(self,loss_t,loss_rp,wt,mu_up=1.05,mu_down=1.05,tau_t=1.5,tau_rp=1.5, beta_s=0.6):
+    #     if loss_t >mu_up*loss_rp:
+    #         wt_newc = np.clip(tau_t*wt,0.2,5)
+    #     elif loss_rp > mu_down*loss_t:
+    #         wt_newc = np.clip(wt/tau_rp,0.2,5)
+    #     else:
+    #         wt_newc = wt
+    #     wt_new = (1-beta_s)*wt + beta_s*wt_newc
+     
+    #     return wt_new
     
+    
+    def adaptive_meta_loss_weights(self, loss_t, loss_rp, g_t, g_rp, wt, alpha=5, beta_w=0.8, eps=1e-8, k_min=0.2, k_max=200.0):
+        # -------- safer auto-K (clip + exponent) --------
+        k_auto = (loss_t / (loss_rp + eps)) ** alpha
+        k_auto = float(np.clip(k_auto, k_min, k_max))
+        wt_target = 2.0 * k_auto * g_rp / (g_t + k_auto * g_rp + eps)
+        # -------- slow weight update --------
+        wt_new = (1 - beta_w) * wt + beta_w * wt_target
+        wt_new = float(np.clip(wt_new, 0.01, 1.99))
+        wrp_new = 2.0 - wt_new
+
+        return wt_new, wrp_new, k_auto
+
+
+    # def adaptive_meta_loss_weights(self, loss_t, loss_rp,wt,alpha=10, beta_w=0.6, eps=1e-8, k_min=0.2, k_max=100.0):
+
+    #     # --- init previous losses for velocity ---
+    #     if not hasattr(self, "Lt_prev"):
+    #         self.Lt_prev  = float(loss_t)
+    #         self.Lrp_prev = float(loss_rp)
+
+    #     Lt  = float(loss_t)
+    #     Lrp = float(loss_rp)
+
+    #     # --- loss velocities (finite difference) ---
+    #     vt  = (self.Lt_prev  - Lt)  / (abs(self.Lt_prev)  + eps)   # >0 = improving
+    #     vrp = (self.Lrp_prev - Lrp) / (abs(self.Lrp_prev) + eps)
+
+    #     self.Lt_prev  = Lt
+    #     self.Lrp_prev = Lrp
+
+    #     # --- convert velocity to "difficulty" (like grad norms) ---
+    #     g_t  = 1.0 / (max(vt,  0.0) + eps)
+    #     g_rp = 1.0 / (max(vrp, 0.0) + eps)
+
+       
+    #     k_auto = (Lt / (Lrp + eps)) ** alpha
+    #     k_auto = float(np.clip(k_auto, k_min, k_max))
+
+    #     wt_target = 2.0 * k_auto * g_rp / (g_t + k_auto * g_rp + eps)
+
+    #     wt_new = (1 - beta_w) * wt + beta_w * wt_target
+    #     wt_new = float(np.clip(wt_new, 0.01, 1.99))
+    #     wrp_new = 2.0 - wt_new
+
+    #     return wt_new, wrp_new, k_auto
+    
+    # def adaptive_meta_loss_weights(self, loss_rp,threshold=1e-1,wrp_min=0.01,wrp_max=2,k=20):
+    #     s = 1/(1+exp(-k*(loss_rp-threshold)))
+    #     wrp = wrp_min + (wrp_max-wrp_min)*s
+    #     return wrp
+
+    # def adaptive_meta_loss_weights(self, loss_t, loss_rp, wt, alpha=2, beta_w=0.9, eps=1e-8, k_min=0.001, k_max=1000.0):
+     
+    #     # --- state initialization ---
+    #     if not hasattr(self, "Lt_prev"):
+    #         self.Lt_prev = float(loss_t)
+    #         self.Lrp_prev = float(loss_rp)
+    #         # On the first run, return the initial weights without change
+    #         return wt, 2.0 - wt, 1.0
+
+    #     Lt = float(loss_t)
+    #     Lrp = float(loss_rp)
+
+    #     # --- loss velocity calculation  ---
+    #     vt = (self.Lt_prev - Lt) / (abs(self.Lt_prev) + eps)   # >0 = improving
+    #     vrp = (self.Lrp_prev - Lrp) / (abs(self.Lrp_prev) + eps)
+
+    #     # --- state update  ---
+    #     self.Lt_prev = Lt
+    #     self.Lrp_prev = Lrp
+
+    #     # --- MODIFICATION 1: Safer "difficulty" metric ---
+    #     # Using abs() is more stable than max(0,...) if a loss temporarily gets worse.
+    #     # A smaller velocity (closer to zero or negative) means higher difficulty.
+    #     difficulty_t = 1.0 / (abs(vt) + eps)
+    #     difficulty_rp = 1.0 / (abs(vrp) + eps)
+
+    #     # --- MODIFICATION 2: 'k_auto' with a safer default alpha ---
+    #     # This term captures the static ratio of the losses.
+    #     k_auto = (Lt / (Lrp + eps)) ** alpha
+    #     k_auto = float(np.clip(k_auto, k_min, k_max))
+
+    #     # --- MODIFICATION 3: Simpler and more direct 'wt_target' calculation ---
+    #     # This combines the static signal (k_auto) and the dynamic signal (difficulty ratio)
+    #     # into a single target for the weight of loss_t.
+    #     wt_target = 2.0 * k_auto * difficulty_rp / (difficulty_t + k_auto * difficulty_rp + eps)
+
+    #     # --- smoothing and clipping logic (This is good) ---
+    #     wt_new = (1 - beta_w) * wt + beta_w * wt_target
+    #     wt_new = float(np.clip(wt_new, 0.01, 1.99)) # l final clipping
+    #     wrp_new = 2.0 - wt_new
+
+    #     return wt_new, wrp_new, k_auto
+
+
+
+
 
     def Set_Parameters(self,tunable_para):
         weight       = np.zeros(self.n_P)
         for k in range(self.n_P):
             weight[k]= self.p_min + (self.p_max - self.p_min) * 1/(1+np.exp(-tunable_para[k])) # sigmoid boundedness
-            # weight[k]= self.p_min + tunable_para[k]**2
-
+            if k == self.n_P1-2:
+                weight[k] = self.gamma_min + (self.gamma_max-self.gamma_min)* 1/(1+np.exp(-tunable_para[k]))
+            elif k == self.n_P1-1:
+                weight[k] = self.gamma_min + (self.gamma_max-self.gamma_min)* 1/(1+np.exp(-tunable_para[k]))
+        
         return weight
     
 
@@ -1276,8 +1446,11 @@ class Gradient_Solver:
         weight       = np.zeros(self.n_P)
         for k in range(self.n_P):
             weight[k]= self.p_min + (self.p_max - self.p_min) * tunable_para[0,k] # sigmoid boundedness
-            # weight[k]= self.p_min + tunable_para[k]**2
-
+            if k == self.n_P1-2:
+                weight[k] = self.gamma_min + (self.gamma_max-self.gamma_min)* tunable_para[0,k]
+            elif k== self.n_P1-1:
+                weight[k] = self.gamma_min + (self.gamma_max-self.gamma_min)* tunable_para[0,k]
+        
         return weight
     
     def ChainRule_Gradient(self,tunable_para):
@@ -1285,6 +1458,10 @@ class Gradient_Solver:
         Weight       = SX.sym('wp',1,self.n_P)
         for k in range(self.n_P):
             Weight[k]= self.p_min + (self.p_max - self.p_min) * 1/(1 + exp(-Tunable[k])) # sigmoid boundedness
+            if k == self.n_P1-2:
+                Weight[k]= self.gamma_min + (self.gamma_max-self.gamma_min) * 1/(1 + exp(-Tunable[k])) 
+            elif k== self.n_P1-1:
+                Weight[k]= self.gamma_min + (self.gamma_max-self.gamma_min) * 1/(1 + exp(-Tunable[k])) 
         dWdT         = jacobian(Weight,Tunable)
         dWdT_fn      = Function('dWdT',[Tunable],[dWdT],['Tp0'],['dWdT_f'])
         weight_grad  = dWdT_fn(Tp0=tunable_para)['dWdT_f'].full()
@@ -1296,6 +1473,10 @@ class Gradient_Solver:
         Weight       = SX.sym('wp',1,self.n_P)
         for k in range(self.n_P):
             Weight[k]= self.p_min + (self.p_max - self.p_min) * Tunable[k] # sigmoid boundedness
+            if k == self.n_P1-2:
+                Weight[k] = self.gamma_min + (self.gamma_max-self.gamma_min)* Tunable[k]
+            elif k== self.n_P1-1:
+                Weight[k] = self.gamma_min + (self.gamma_max-self.gamma_min)* Tunable[k]
         dWdT         = jacobian(Weight,Tunable)
         dWdT_fn      = Function('dWdT',[Tunable],[dWdT],['Tp0'],['dWdT_f'])
         weight_grad  = dWdT_fn(Tp0=tunable_para)['dWdT_f'].full()
@@ -1318,6 +1499,10 @@ class Gradient_Solver:
             r_primal_x     = np.reshape(xl_opt[k,:],(self.n_xl,1)) - np.reshape(scxl_opt[k,:],(self.n_xl,1))
             r_primal_w     = np.reshape(Wl_opt[k,:],(self.n_Wl,1)) - np.reshape(scWl_opt[k,:],(self.n_Wl,1))
             loss_rp       += r_primal_x.T@r_primal_x + r_primal_w.T@r_primal_w 
+        xl_N    = np.reshape(xl_opt[self.N,:],(self.n_xl,1)) 
+        refxl_N = np.reshape(Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl],(self.n_xl,1))
+        error_N = xl_N - refxl_N
+        loss_track    += error_N.T@error_N
         loss = wt*loss_track + wrp*loss_rp 
         return loss, loss_track, loss_rp
     
@@ -1362,8 +1547,9 @@ class Gradient_Solver:
         dltdxl_N    = dltdxl_fn(xl0=xl_opt[-1,:],refxl0=Ref_xl[self.N*self.n_xl:(self.N+1)*self.n_xl])['dltdxl_f'].full()
         dltdw      += dltdxl_N@xl_grad[self.N]
         dldw        = wt*dltdw + wrp*dlrpdw 
-
-        return dldw, loss, loss_track, loss_rp
+        gloss_t     = LA.norm(dltdw)
+        gloss_rp    = LA.norm(dlrpdw)
+        return dldw, loss, loss_track, loss_rp, gloss_t, gloss_rp
         
         
             
