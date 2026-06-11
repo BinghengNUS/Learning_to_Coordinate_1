@@ -11,7 +11,7 @@ class multilift_model:
         # Payload's parameters
         self.m1     = sysm_para[0] # the payload's mass [kg]
         self.m2     = sysm_para[1] # the added mass [kg]
-        self.Jlcom  = np.diag(sysm_para[1:4]) # rotational inertia of m1 about its Geometric Center (GC)
+        self.Jlcom  = np.diag(sysm_para[2:5]) # rotational inertia of m1 about its Geometric Center (GC)
         self.ml     = self.m1 + self.m2
         # Payload's state and control
         self.pl     = SX.sym('pl',3,1) # position of center-of-mass (COM) of the payload in {I}
@@ -97,7 +97,7 @@ class multilift_model:
         return R
     
     
-    def payload_dyn(self, xl, ul):
+    def payload_dyn(self, xl, Wl):
         """
         Use the following cable attachment settings:
         configuration of the payload tether attachment points:
@@ -120,8 +120,8 @@ class multilift_model:
         # Angular velocity in {Bl}
         wl      = vertcat(xl[10,0], xl[11,0], xl[12,0])
         # Cable forces and torques
-        Fl      = vertcat(ul[0,0], ul[1,0], ul[2,0]) # in {I}
-        Mtl     = vertcat(ul[3,0], ul[4,0], ul[5,0])
+        Fl      = vertcat(Wl[0,0], Wl[1,0], Wl[2,0]) # in {I}
+        Ml      = vertcat(Wl[3,0], Wl[4,0], Wl[5,0])
         # Kinematics
         dpl     = vl
         dvl     = -self.g*self.ez + 1/self.ml * Fl # model defined at the COM
@@ -131,7 +131,7 @@ class multilift_model:
             horzcat(wl,-S_wl)
         )
         dql     = 1/2*omega@ql
-        dwl     = LA.inv(self.Jl)@(Mtl-S_wl@(self.Jl@wl))
+        dwl     = LA.inv(self.Jl)@(Ml-S_wl@(self.Jl@wl))
         # Model
         model_l = vertcat(dpl, dvl, dql, dwl)
 
@@ -174,7 +174,7 @@ class multilift_model:
 
         return ref_p, ref_v, ref_a, ref_j, ref_s
     
-    def minisnap_load_circle(self,Coeffx,Coeffy,Coeffz,time,rg): # 3 trajectories
+    def minisnap_load_circle(self,Coeffx,Coeffy,Coeffz,time,rg): # 2 trajectories
         t_switch = 0
         t1 = 2.4 # for tf = 4s
         if time <t1:
@@ -197,6 +197,92 @@ class multilift_model:
         ref_Wl= np.reshape(np.vstack((ref_Fl,ref_ml)),self.nWl)
         return ref_xl, ref_Wl
     
+
+    def minisnap_load_S_shape(self,Coeffx,Coeffy,Coeffz,time,rg): # 4 trajectories
+        t_switch = 0
+        t1 = 2
+        t2 = 1
+        t3 = 1
+        if time <t1:
+            ref_px, ref_vx, ref_ax, ref_jx, ref_sx = self.polytraj(Coeffx[0,:],time,t_switch)
+            ref_py, ref_vy, ref_ay, ref_jy, ref_sy = self.polytraj(Coeffy[0,:],time,t_switch)
+            ref_pz, ref_vz, ref_az, ref_jz, ref_sz = self.polytraj(Coeffz[0,:],time,t_switch)
+       
+        elif time<(t1+t2):
+            ref_px, ref_vx, ref_ax, ref_jx, ref_sx = self.polytraj(Coeffx[1,:],time,t1+t_switch)
+            ref_py, ref_vy, ref_ay, ref_jy, ref_sy = self.polytraj(Coeffy[1,:],time,t1+t_switch)
+            ref_pz, ref_vz, ref_az, ref_jz, ref_sz = self.polytraj(Coeffz[1,:],time,t1+t_switch)
+        elif time<(t1+t2+t3):
+            ref_px, ref_vx, ref_ax, ref_jx, ref_sx = self.polytraj(Coeffx[2,:],time,t1+t2+t_switch)
+            ref_py, ref_vy, ref_ay, ref_jy, ref_sy = self.polytraj(Coeffy[2,:],time,t1+t2+t_switch)
+            ref_pz, ref_vz, ref_az, ref_jz, ref_sz = self.polytraj(Coeffz[2,:],time,t1+t2+t_switch)
+        else:
+            ref_px, ref_vx, ref_ax, ref_jx, ref_sx = self.polytraj(Coeffx[3,:],time,t1+t2+t3+t_switch)
+            ref_py, ref_vy, ref_ay, ref_jy, ref_sy = self.polytraj(Coeffy[3,:],time,t1+t2+t3+t_switch)
+            ref_pz, ref_vz, ref_az, ref_jz, ref_sz = self.polytraj(Coeffz[3,:],time,t1+t2+t3+t_switch)
+        ref_p = np.reshape(np.vstack((ref_px, ref_py, ref_pz)), (3,1))+np.reshape(np.vstack((rg[0],rg[1],0)),(3,1))
+        ref_v = np.reshape(np.vstack((ref_vx, ref_vy, ref_vz)), (3,1))
+        ref_q = np.array([[1,0,0,0]]).T
+        ref_w = np.zeros((3,1))
+        ref_xl= np.reshape(np.vstack((ref_p,ref_v,ref_q,ref_w)),self.nxl)
+        ref_a = np.reshape(np.vstack((ref_ax, ref_ay, ref_az)), (3,1))
+        ref_Fl= self.ml*(ref_a + self.g*self.ez) # reference force in the load's desired body frame (Rl = identity matrix)
+        ref_ml= np.zeros((3,1)) # reference torque in the load's desired body frame
+        ref_Wl= np.reshape(np.vstack((ref_Fl,ref_ml)),self.nWl)
+        return ref_xl, ref_Wl
+    
+
+    def minisnap_load_straight(self,Coeffx,Coeffy,Coeffz,time,rg): 
+        t_switch = 0
+        t1       = 2.5
+        if time <t1:
+            ref_px, ref_vx, ref_ax, ref_jx, ref_sx = self.polytraj(Coeffx[0,:],time,t_switch)
+            ref_py, ref_vy, ref_ay, ref_jy, ref_sy = self.polytraj(Coeffy[0,:],time,t_switch)
+            ref_pz, ref_vz, ref_az, ref_jz, ref_sz = self.polytraj(Coeffz[0,:],time,t_switch)
+        else:
+            ref_px, ref_vx, ref_ax, ref_jx, ref_sx = self.polytraj(Coeffx[1,:],time,t1+t_switch)
+            ref_py, ref_vy, ref_ay, ref_jy, ref_sy = self.polytraj(Coeffy[1,:],time,t1+t_switch)
+            ref_pz, ref_vz, ref_az, ref_jz, ref_sz = self.polytraj(Coeffz[1,:],time,t1+t_switch)
+        ref_p = np.reshape(np.vstack((ref_px, ref_py, ref_pz)), (3,1))+np.reshape(np.vstack((rg[0],rg[1],0)),(3,1))
+        ref_v = np.reshape(np.vstack((ref_vx, ref_vy, ref_vz)), (3,1))
+        ref_q = np.array([[1,0,0,0]]).T
+        ref_w = np.zeros((3,1))
+        ref_xl= np.reshape(np.vstack((ref_p,ref_v,ref_q,ref_w)),self.nxl)
+        ref_a = np.reshape(np.vstack((ref_ax, ref_ay, ref_az)), (3,1))
+        ref_Fl= self.ml*(ref_a + self.g*self.ez) # reference force in the load's desired body frame (Rl = identity matrix)
+        ref_ml= np.zeros((3,1)) # reference torque in the load's desired body frame
+        ref_Wl= np.reshape(np.vstack((ref_Fl,ref_ml)),self.nWl)
+        return ref_xl, ref_Wl
+    
+    def target_point_only(self,ref_px,ref_py,ref_pz,rg): 
+        ref_vx, ref_vy, ref_vz = 0, 0, 0
+        ref_ax, ref_ay, ref_az = 0, 0, 0
+        ref_p = np.reshape(np.vstack((ref_px, ref_py, ref_pz)), (3,1))+np.reshape(np.vstack((rg[0],rg[1],0)),(3,1))
+        ref_v = np.reshape(np.vstack((ref_vx, ref_vy, ref_vz)), (3,1))
+        ref_q = np.array([[1,0,0,0]]).T
+        ref_w = np.zeros((3,1))
+        ref_xl= np.reshape(np.vstack((ref_p,ref_v,ref_q,ref_w)),self.nxl)
+        ref_a = np.reshape(np.vstack((ref_ax, ref_ay, ref_az)), (3,1))
+        ref_Fl= self.ml*(ref_a + self.g*self.ez) # reference force in the load's desired body frame (Rl = identity matrix)
+        ref_ml= np.zeros((3,1)) # reference torque in the load's desired body frame
+        ref_Wl= np.reshape(np.vstack((ref_Fl,ref_ml)),self.nWl)
+        return ref_xl, ref_Wl
+    
+    def infeasible_load(self,Coeffx,Coeffy,Coeffz,time,rg):
+        t_switch = 0
+        ref_px, ref_vx, ref_ax, ref_jx, ref_sx = self.polytraj(Coeffx[0,:],time,t_switch)
+        ref_py, ref_vy, ref_ay, ref_jy, ref_sy = self.polytraj(Coeffy[0,:],time,t_switch)
+        ref_pz, ref_vz, ref_az, ref_jz, ref_sz = self.polytraj(Coeffz[0,:],time,t_switch)
+        ref_p = np.reshape(np.vstack((ref_px, ref_py, ref_pz)), (3,1))+np.reshape(np.vstack((rg[0],rg[1],0)),(3,1))
+        ref_v = np.reshape(np.vstack((ref_vx, ref_vy, ref_vz)), (3,1))
+        ref_q = np.array([[1,0,0,0]]).T
+        ref_w = np.zeros((3,1))
+        ref_xl= np.reshape(np.vstack((ref_p,ref_v,ref_q,ref_w)),self.nxl)
+        ref_a = np.reshape(np.vstack((ref_ax, ref_ay, ref_az)), (3,1))
+        ref_Fl= self.ml*(ref_a + self.g*self.ez) # reference force in the load's desired body frame (Rl = identity matrix)
+        ref_ml= np.zeros((3,1)) # reference torque in the load's desired body frame
+        ref_Wl= np.reshape(np.vstack((ref_Fl,ref_ml)),self.nWl)
+        return ref_xl, ref_Wl
 
     
     
