@@ -1,7 +1,9 @@
-# Learning_to_Coordinate_1
-Learning to Coordinate (L2C) is a general framework that meta-learns key hyperparameters for ADMM-DDP-based multiagent distributed trajectory optimization and adapts to diverse tasks and team sizes. These hyperparameters are modeled using lightweight, agent-wise neural networks to achieve the adaptations, trained efficiently by analytically differentiating through the ADMM-DDP pipeline end-to-end. We validate the effectiveness of L2C on a multilift system, a challenging multiagent system consisting of multiple quadrotors cooperatively transporting a cable-suspended load. Our method achieves faster gradient computation than state-of-the-art methods such as PDP [[1]](#1)., and exhibits strong generalizability to diverse system dynamics, tasks, and team sizes without extra tuning.
+# DiffCoord
+Differentiable Coordination (DiffCoord) is a unified meta-learning framework that differentiates the truncated ADMM-DDP pipeline end-to-end to jointly learn task-adaptive problem-level and solver-level parameters for efficient distributed multi-agent trajectory optimization. Its main feature is a structure-exploiting ADMM-LQR distributed gradient solver that mirrors the forward ADMM-DDP pipeline and reuses key DDP and ADMM computation results. Applied to multilift systems, DiffCoord enables task-adaptive formation reconfiguration, scalable deployment across different team sizes, and robust real-flight payload transport through constrained spaces. 
 
-<img width="3599" height="1552" alt="diagram_github" src="https://github.com/user-attachments/assets/94cf529a-96d2-4e87-b3c5-f9783a90621c" />
+<img width="4490" height="1930" alt="diagram_github" src="https://github.com/user-attachments/assets/5fa35ed5-d6ff-46e9-a42b-12c977e1ee2d" />
+
+
 
 ## Citation
 If you find this work helpful in your publications, we would appreciate citing our paper。
@@ -34,20 +36,25 @@ Please make sure that the following packages have already been installed before 
 * Scipy: version 1.8.1 Info: https://scipy.org/
 * Pandas: version 1.4.2 Info: https://pandas.pydata.org/
 * scikit-learn: version 1.0.2 Info: https://scikit-learn.org/stable/whats_new/v1.0.html
+* jax: version 0.9.0.1 Info: https://docs.jax.dev/en/latest/installation.html
+* jaxlib: version 0.9.0.1 Info: https://docs.jax.dev/en/latest/jep/9419-jax-versioning.html
+* JAXopt: version 0.8.5 Info: https://jaxopt.github.io/stable/ 
 
 ## 2. How to Use
-The implementation of L2C for multilift systems is straightforward to setup.  Simply follow the steps outlined below, sequentially, after downloading all the necessary files and folders.
-1. Run the Python file '**Meta_learning_cable_references.py**' to meta-learn collision-free cable references. Before running, you can specify the system's parameters such as the quadrotor count, the load mass, and the cable length in Line 34 '*sysm_para*' where these parameters from left to right denote the load mass, the load radius, the load's rotational inertia, the load's CoM offset vector, the quadrotor count, the cable length, the quadrotor radius, and the obstacle radius. When running the code, you will be asked to choose the training mode: 't' for training and 'e' for evaluate; 'n' for neural adaptive hyperparameters and 'f' for fixed hyperparameters.
-2. Run the same Python file $M$ times, where $M$ denotes the task count, by selecting 'e' for evaluation.
-3. Run the Python file '**Meta_learning_cable_trajectories.py**' to meta-learn dynamically feasible cable trajectories. Set '*sysm_para*' in Line 38 to be the same as that in the file '**Meta_learning_cable_references.py**'， except for the last parameter denoting the quadrotor mass.
+The implementation of Diffoord for multilift systems is straightforward to setup.  Simply follow the steps outlined below, sequentially, after downloading all the necessary files and folders.
+1. Run the Python file '**main_LoadPlanner_DDP_ADMM_quaternion_Meta_Learning_COM_Dyn.py**' to meta-learn collision-free cable references. When running the code, you will be asked to choose the training mode: 't' for training and 'e' for evaluate; 'n' for neural adaptive hyperparameters and 'f' for fixed hyperparameters.
+2. Run the Python file '**main_load_kinodynamic_planner_ADMM_DDP_Meta_learning_2nd_COM_Dyn_true_parallel_best_backup.py**' to meta-learn dynamically feasible cable trajectories.
 
-|       Training loss       |      Episode 0     | Episode 33|
-|-----------------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
-<img width="870" height="835" alt="meanloss_comparison2" src="https://github.com/user-attachments/assets/6f7b6053-11b9-4b21-b5b6-4d4c4fec7719" /> | <img width="817" height="853" alt="multiagent007" src="https://github.com/user-attachments/assets/0c4824b2-0b60-4bff-ad23-63e68db2e75b" />  | <img width="817" height="853" alt="multiagent3307" src="https://github.com/user-attachments/assets/3677702e-e075-4165-942e-2f86cf962dc9" />
+Stage |       Training loss       |      Untrained     | Trained |
+------|-----------------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
+Stage 1 |<img width="944" height="472" alt="stage1_training_meta_loss" src="https://github.com/user-attachments/assets/95106504-c36b-4211-96c0-00504053650d" /> | <img width="944" height="944" alt="four_quadrotor_stage1_episode0" src="https://github.com/user-attachments/assets/8b5c9994-e04d-4c28-85ec-0e331605f55d" /> |   <img width="944" height="944" alt="four_quadrotor_stage1_episode13" src="https://github.com/user-attachments/assets/51cebb15-1ac1-45aa-94cf-14bc97b29ea9" />
+Stage 2 |<img width="944" height="472" alt="stage2_training_meta_loss" src="https://github.com/user-attachments/assets/e87b44ac-68c3-4c4c-8ae0-4db72e1d3640" /> | <img width="944" height="944" alt="four_quadrotor_stage2_episode0" src="https://github.com/user-attachments/assets/c8467ffc-b435-4fd5-a964-4e91d2fc11e7" /> |<img width="944" height="944" alt="four_quadrotor_stage2_episode52" src="https://github.com/user-attachments/assets/c0fc321b-81fe-4248-8f45-9c169ccd0889" />
 
-|     Three-quadrotor team | Six-quadrotor team | Seven-quadrotor team |
-|-----------------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
-![3_lift_-3_2_DDP](https://github.com/user-attachments/assets/540b1b1c-a35c-4dc6-bba5-f5c307c66c15) | ![6_lift_-3_2_DDP](https://github.com/user-attachments/assets/49a68a58-6f62-48fd-836a-3035bea2d15f) | ![7_lift_-3_2_DDP](https://github.com/user-attachments/assets/df62b0c8-aa98-4217-8cd2-4551f09a1973)
+We conduct real-flight experiments using two multilift systems with three and six quadrotors, respectively. The meta-learned networks, trained on the 4-quadrotor multilift system, are directly deployed to the two-stage ADMM-DDP pipelines for both systems without extra tuning.
+
+https://github.com/user-attachments/assets/bf191b6d-0a06-452b-938f-161fa88ae77b
+
+
 
 
 ## 3. Contact Us
@@ -56,7 +63,3 @@ If you encounter a bug in your implementation of the code, please do not hesitat
 * Email: wangbingheng@u.nus.edu
 
 
-
-## References
-<a id="1">[1]</a> 
-Jin, Wanxin and Mou, Shaoshuai and Pappas, George J, "Safe pontryagin differentiable programming", Advances in Neural Information Processing Systems, 34, 16034--16050, 2021
