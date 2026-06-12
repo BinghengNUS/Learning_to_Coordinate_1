@@ -9,10 +9,10 @@ Differentiable Coordination (DiffCoord) is a unified meta-learning framework tha
 If you find this work helpful in your publications, we would appreciate citing our paper。
 
 ```
-@misc{wang2025learningcoordinatedistributedmetatrajectory,
-      title={Learning to Coordinate: Distributed Meta-Trajectory Optimization Via Differentiable ADMM-DDP}, 
-      author={Bingheng Wang and Yichao Gao and Tianchen Sun and Lin Zhao},
-      year={2025},
+@misc{wang2026diffcoorddifferentiablecoordinationdistributed,
+      title={DiffCoord: Differentiable Coordination for Distributed Multi-Agent Trajectory Optimization}, 
+      author={Bingheng Wang and Yichao Gao and Tianchen Sun and Shanker Ajay and Lin Zhao},
+      year={2026},
       eprint={2509.01630},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
