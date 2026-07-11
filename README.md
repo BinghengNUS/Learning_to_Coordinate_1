@@ -54,7 +54,7 @@ We conduct real-flight experiments using two multilift systems with three and si
 
 https://github.com/user-attachments/assets/bf191b6d-0a06-452b-938f-161fa88ae77b
 
-
+To reproduce the 6s (3-drone) and 5s (6-drone) flight trajectories used in the experiments, run the Python file '**main_load_kinodynamic_planner_ADMM_DDP_2nd_evaluation_COM_Dyn_HV**' and '**main_load_kinodynamic_planner_ADMM_DDP_2nd_evaluation_COM_Dyn_V_6**', respectively.
 
 
 ## 3. Contact Us
