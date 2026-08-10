@@ -1,5 +1,5 @@
 # DiffCoord
-Differentiable Coordination (DiffCoord) is a unified meta-learning framework that differentiates the truncated ADMM-DDP pipeline end-to-end to jointly learn task-adaptive problem-level and solver-level parameters for efficient distributed multi-agent trajectory optimization. Its main feature is a structure-exploiting ADMM-LQR distributed gradient solver that mirrors the forward ADMM-DDP pipeline and reuses key DDP and ADMM computation results. Applied to multilift systems, DiffCoord enables task-adaptive formation reconfiguration, scalable deployment across different team sizes, and robust real-flight payload transport through constrained spaces. 
+Differentiable Coordination (DiffCoord) is a meta-learning framework that differentiates the ADMM-DDP pipeline end-to-end to learn its task-adaptive key parameters for efficient distributed multi-agent trajectory optimization. Its main feature is a structure-exploiting ADMM-LQR distributed gradient solver that mirrors the forward ADMM-DDP pipeline and reuses key DDP and ADMM computation results. Applied to multilift systems, DiffCoord enables task-adaptive formation reconfiguration, scalable deployment across different team sizes, and robust real-flight payload transport through constrained spaces. 
 
 <img width="4490" height="1930" alt="diagram_github" src="https://github.com/user-attachments/assets/5fa35ed5-d6ff-46e9-a42b-12c977e1ee2d" />
 
@@ -43,7 +43,7 @@ Please make sure that the following packages have already been installed before 
 ## 2. How to Use
 The implementation of Diffoord for multilift systems is straightforward to setup.  Simply follow the steps outlined below, sequentially, after downloading all the necessary files and folders.
 1. Run the Python file '**main_LoadPlanner_DDP_ADMM_quaternion_Meta_Learning_COM_Dyn.py**' to meta-learn collision-free cable references. When running the code, you will be asked to choose the training mode: 't' for training and 'e' for evaluate; 'n' for neural adaptive hyperparameters and 'f' for fixed hyperparameters.
-2. Run the Python file '**main_load_kinodynamic_planner_ADMM_DDP_Meta_learning_2nd_COM_Dyn_true_parallel_best_backup.py**' to meta-learn dynamically feasible cable trajectories.
+2. Run the Python file '**main_load_kinodynamic_planner_ADMM_DDP_Meta_learning_2nd_COM_Dyn_true_parallel_best_backup_ref.py**' to meta-learn dynamically feasible cable trajectories.
 
 Stage |       Training loss       |      Untrained     | Trained |
 ------|-----------------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
